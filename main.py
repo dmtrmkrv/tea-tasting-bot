@@ -3,7 +3,6 @@ import logging
 import os
 import datetime
 import uuid
-import textwrap
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Union
 
@@ -12,7 +11,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, BotCommand,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, FSInputFile
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, FSInputFile,
+    InputMediaPhoto,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
@@ -20,15 +20,26 @@ from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
 from sqlalchemy import (
-    create_engine, Integer, String, DateTime, ForeignKey, select, func
+    create_engine,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    select,
+    func,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
-
-from aiogram.types import InputMediaPhoto
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    relationship,
+    sessionmaker,
+)
 
 # ---------------- ЛОГИ ----------------
 
 logging.basicConfig(level=logging.INFO)
+
 
 # ---------------- НАСТРОЙКИ ----------------
 
@@ -56,8 +67,8 @@ def get_settings() -> Settings:
 
 cfg: Settings  # присвоим в main()
 
-# ---------------- БД ----------------
 
+# ---------------- БД ----------------
 
 class Base(DeclarativeBase):
     pass
@@ -65,8 +76,8 @@ class Base(DeclarativeBase):
 
 class User(Base):
     """
-    Настройки конкретного Telegram-пользователя:
-    - tz_offset_min: сдвиг относительно UTC в минутах (например, Москва ~ +180)
+    Таблица для пользовательских настроек.
+    Сейчас используется только tz_offset_min (смещение пояса в минутах от UTC).
     """
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)  # telegram user_id
@@ -84,11 +95,8 @@ class Tasting(Base):
         DateTime, default=datetime.datetime.utcnow, nullable=False
     )
 
-    # кто создал
+    # кто создал запись
     user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-
-    # таймзона пользователя на момент записи, минутами относительно UTC
-    tz_offset_min: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     name: Mapped[str] = mapped_column(String(200))
     year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -99,7 +107,7 @@ class Tasting(Base):
     temp_c: Mapped[Optional[int]] = mapped_column(nullable=True)
     tasted_at: Mapped[Optional[str]] = mapped_column(
         String(8), nullable=True
-    )  # "HH:MM" в локальной зоне
+    )  # "HH:MM" локальное для юзера
     gear: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
 
     aroma_dry: Mapped[Optional[str]] = mapped_column(nullable=True)
@@ -114,7 +122,7 @@ class Tasting(Base):
     )  # «Сценарии»
 
     rating: Mapped[int] = mapped_column(Integer, default=0)
-    summary: Mapped[Optional[str]] = mapped_column(nullable=True)  # «Заметка»
+    summary: Mapped[Optional[str]] = mapped_column(nullable=True)
 
     infusions: Mapped[List["Infusion"]] = relationship(
         back_populates="tasting", cascade="all, delete-orphan"
@@ -167,23 +175,30 @@ SessionLocal = None  # фабрика сессий
 
 
 def setup_db(db_url: str):
+    """
+    Создаёт таблицы, если их нет.
+    Важно: не мигрирует существующие (мы без Alembic), поэтому мы избегаем ломающих изменений.
+    """
     global SessionLocal
     engine = create_engine(db_url, echo=False, future=True)
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
-# ---------------- ФУНКЦИИ ПОЛЬЗОВАТЕЛЯ / ТАЙМЗОНЫ ----------------
-
+# ---------------- ЧАСОВОЙ ПОЯС ----------------
 
 def get_or_create_user(uid: int) -> User:
     """
-    Возвращает пользователя из БД или создаёт нового с tz_offset_min=0.
+    Возвращает или создаёт запись о пользователе (часовой пояс и т.д.).
     """
     with SessionLocal() as s:
         u = s.get(User, uid)
         if not u:
-            u = User(id=uid, created_at=datetime.datetime.utcnow(), tz_offset_min=0)
+            u = User(
+                id=uid,
+                created_at=datetime.datetime.utcnow(),
+                tz_offset_min=0,
+            )
             s.add(u)
             s.commit()
             s.refresh(u)
@@ -192,7 +207,7 @@ def get_or_create_user(uid: int) -> User:
 
 def set_user_tz(uid: int, offset_min: int) -> None:
     """
-    Сохранить смещение часового пояса (в минутах относительно UTC).
+    Запомнить сдвиг (в минутах относительно UTC).
     """
     with SessionLocal() as s:
         u = s.get(User, uid)
@@ -210,7 +225,8 @@ def set_user_tz(uid: int, offset_min: int) -> None:
 
 def get_user_now_hm(uid: int) -> str:
     """
-    Возвращает локальное для пользователя 'HH:MM' (по сохранённой tz_offset_min).
+    Возвращает локальное время пользователя вида HH:MM
+    по сохранённому смещению tz_offset_min.
     """
     u = get_or_create_user(uid)
     off = u.tz_offset_min or 0
@@ -224,7 +240,6 @@ def get_user_now_hm(uid: int) -> str:
 CATEGORIES = ["Зелёный", "Белый", "Красный", "Улун", "Шу Пуэр", "Шен Пуэр", "Хэй Ча", "Другое"]
 BODY_PRESETS = ["тонкое", "лёгкое", "среднее", "плотное", "маслянистое"]
 
-# Новый набор «Ощущения»
 EFFECTS = [
     "Тепло",
     "Охлаждение",
@@ -236,10 +251,15 @@ EFFECTS = [
     "Сонливость",
 ]
 
-# Новый набор «Сценарии»
-SCENARIOS = ["Отдых", "Работа/учеба", "Творчество", "Медитация", "Общение", "Прогулка"]
+SCENARIOS = [
+    "Отдых",
+    "Работа/учеба",
+    "Творчество",
+    "Медитация",
+    "Общение",
+    "Прогулка",
+]
 
-# Общие дескрипторы для аромата/вкуса
 DESCRIPTORS = [
     "сухофрукты",
     "мёд",
@@ -256,7 +276,6 @@ DESCRIPTORS = [
     "землистый",
 ]
 
-# Новый набор для послевкусия
 AFTERTASTE_SET = [
     "сладкий",
     "фруктовый",
@@ -275,8 +294,8 @@ AFTERTASTE_SET = [
 
 PAGE_SIZE = 5
 
-# ---------------- КЛАВИАТУРЫ ----------------
 
+# ---------------- КЛАВИАТУРЫ ----------------
 
 def main_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
@@ -316,6 +335,7 @@ def category_kb() -> InlineKeyboardBuilder:
 def skip_kb(tag: str) -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="Пропустить", callback_data=f"skip:{tag}")
+    kb.adjust(1)
     return kb
 
 
@@ -413,23 +433,6 @@ def confirm_del_kb(t_id: int) -> InlineKeyboardBuilder:
     return kb
 
 
-def any_category_kb() -> InlineKeyboardBuilder:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Любая", callback_data="advcat:any")
-    for c in CATEGORIES:
-        kb.button(text=c, callback_data=f"advcat:{c}")
-    kb.adjust(3, 3)
-    return kb
-
-
-def sort_kb() -> InlineKeyboardBuilder:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Сначала высокий рейтинг", callback_data="advs:rate")
-    kb.button(text="Сначала новые", callback_data="advs:date")
-    kb.adjust(1, 1)
-    return kb
-
-
 def photos_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="Готово", callback_data="photos:done")
@@ -439,7 +442,6 @@ def photos_kb() -> InlineKeyboardBuilder:
 
 
 # ---------------- FSM ----------------
-
 
 class NewTasting(StatesGroup):
     name = State()
@@ -474,40 +476,31 @@ class RatingSummary(StatesGroup):
     summary = State()
 
 
+class PhotoFlow(StatesGroup):
+    photos = State()
+
+
 class SearchFlow(StatesGroup):
     name = State()
-    year = State()
-    cat = State()
 
 
 class EditFlow(StatesGroup):
     waiting_text = State()
 
 
-class AdvSearch(StatesGroup):
-    cat = State()
-    year = State()
-    text = State()
-    min_rating = State()
-    sort = State()
-
-
-class PhotoFlow(StatesGroup):
-    photos = State()
-
-
 # ---------------- ХЭЛПЕРЫ UI ----------------
-
 
 async def ui(target: Union[CallbackQuery, Message], text: str, reply_markup=None):
     """
     Универсальный вывод:
-    - CallbackQuery: пробуем редактировать (caption у медиа или text), иначе шлём новое.
-    - Message: просто отправляем новое сообщение.
+    - если это callback — пытаемся отредачить предыдущее сообщение,
+      если не получается (альбом и т.д.) — шлём новое.
+    - если это message — просто answer().
     """
     try:
         if isinstance(target, CallbackQuery):
             msg = target.message
+            # если это было фото с подписью:
             if getattr(msg, "caption", None) is not None or getattr(msg, "photo", None):
                 await msg.edit_caption(caption=text, reply_markup=reply_markup)
             else:
@@ -526,7 +519,9 @@ def short_row(t: Tasting) -> str:
 
 
 def build_card_text(
-    t: Tasting, infusions: List[dict], photo_count: Optional[int] = None
+    t: Tasting,
+    infusions: List[dict],
+    photo_count: Optional[int] = None,
 ) -> str:
     lines = [f"{t.title}"]
     lines.append(f"⭐ Оценка: {t.rating}")
@@ -555,7 +550,7 @@ def build_card_text(
     if t.summary:
         lines.append(f"📝 Заметка: {t.summary}")
 
-    if photo_count is not None and photo_count > 0:
+    if photo_count:
         lines.append(f"📷 Фото: {photo_count} шт.")
 
     if infusions:
@@ -600,23 +595,23 @@ async def append_current_infusion_and_prompt(msg_or_call, state: FSMContext):
         awaiting_custom_taste=False,
         awaiting_custom_after=False,
     )
-    text = "Добавить ещё пролив или завершаем?"
+
     kb = yesno_more_infusions_kb().as_markup()
+    text = "Добавить ещё пролив или завершаем?"
     if isinstance(msg_or_call, Message):
         await msg_or_call.answer(text, reply_markup=kb)
     else:
         await ui(msg_or_call, text, reply_markup=kb)
 
 
-async def save_and_reply(target_message: Message, state: FSMContext, summary_text: Optional[str]):
+async def finalize_save(target_message: Message, state: FSMContext):
     """
-    Старый вспомогательный путь сохранения без фотографий.
-    Сейчас практически не вызывается, но оставим рабочим.
+    Финальная сборка дегустации: создаём Tasting, Infusion, Photo,
+    чистим FSM, отправляем карточку.
     """
     data = await state.get_data()
     t = Tasting(
         user_id=data.get("user_id"),
-        tz_offset_min=data.get("tz_offset_min"),
         name=data.get("name"),
         year=data.get("year"),
         region=data.get("region"),
@@ -631,12 +626,16 @@ async def save_and_reply(target_message: Message, state: FSMContext, summary_tex
         effects_csv=",".join(data.get("effects", [])) or None,
         scenarios_csv=",".join(data.get("scenarios", [])) or None,
         rating=data.get("rating", 0),
-        summary=summary_text or None,
+        summary=data.get("summary") or None,
     )
+
     infusions_data = data.get("infusions", [])
+    new_photos: List[str] = data.get("new_photos", []) or []
+
     with SessionLocal() as s:
         s.add(t)
         s.flush()
+
         for inf in infusions_data:
             s.add(
                 Infusion(
@@ -650,143 +649,147 @@ async def save_and_reply(target_message: Message, state: FSMContext, summary_tex
                     aftertaste=inf["aftertaste"],
                 )
             )
+
+        for fid in new_photos:
+            s.add(Photo(tasting_id=t.id, file_id=fid))
+
         s.commit()
+        s.refresh(t)
 
     await state.clear()
-    text = build_card_text(t, infusions_data)
-    await target_message.answer(text, reply_markup=main_kb().as_markup())
 
+    text_card = build_card_text(t, infusions_data, photo_count=len(new_photos))
 
-# ---------------- КОНТЕКСТ ПОИСКА ----------------
-
-SEARCH_CTX: Dict[str, dict] = {}
-
-
-def new_ctx(data: dict) -> str:
-    token = uuid.uuid4().hex[:8]
-    SEARCH_CTX[token] = data
-    return token
-
-
-def get_ctx(token: str) -> Optional[dict]:
-    return SEARCH_CTX.get(token)
-
-
-# ---------------- БАННЕР / START ----------------
-
-
-async def show_main_menu_as_photo(bot: Bot, chat_id: int):
-    caption = "Привет! Создать новую запись или найти уже созданную."
-    if cfg.banner_path:
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=FSInputFile(cfg.banner_path),
-            caption=caption,
-            reply_markup=main_kb().as_markup(),
-        )
+    if new_photos:
+        # если одно фото и текст влезает в подпись
+        if len(new_photos) == 1 and len(text_card) <= 1024:
+            await target_message.answer_photo(
+                new_photos[0],
+                caption=text_card,
+                reply_markup=card_actions_kb(t.id).as_markup(),
+            )
+        # если несколько фото и подпись ок
+        elif len(new_photos) > 1 and len(text_card) <= 1024:
+            media = [InputMediaPhoto(media=new_photos[0], caption=text_card)]
+            media += [InputMediaPhoto(media=fid) for fid in new_photos[1:10]]
+            await target_message.bot.send_media_group(
+                target_message.chat.id, media
+            )
+            await target_message.answer(
+                "Действия:", reply_markup=card_actions_kb(t.id).as_markup()
+            )
+        else:
+            # длинный текст карточки
+            await target_message.answer(
+                text_card, reply_markup=card_actions_kb(t.id).as_markup()
+            )
+            if len(new_photos) == 1:
+                await target_message.answer_photo(new_photos[0])
+            else:
+                media = [InputMediaPhoto(media=fid) for fid in new_photos[:10]]
+                await target_message.bot.send_media_group(
+                    target_message.chat.id, media
+                )
     else:
-        await bot.send_message(
-            chat_id=chat_id, text=caption, reply_markup=main_kb().as_markup()
+        # без фото — просто текст
+        await target_message.answer(
+            text_card, reply_markup=card_actions_kb(t.id).as_markup()
         )
 
 
-# ---------------- ОБЩЕЕ ----------------
+# ---------------- ФОТО ПОСЛЕ ЗАМЕТКИ ----------------
+
+class PhotoFlow(StatesGroup):
+    photos = State()
 
 
-async def on_start(message: Message):
-    await show_main_menu_as_photo(message.bot, message.chat.id)
+def photos_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Готово", callback_data="photos:done")
+    kb.button(text="Пропустить", callback_data="skip:photos")
+    kb.adjust(2)
+    return kb
 
 
-async def help_cmd(message: Message):
-    await message.answer(
-        "/start — меню\n"
-        "/new — новая дегустация\n"
-        "/find — поиск\n"
-        "/last — последние 5\n"
-        "/tz — часовой пояс\n"
-        "/menu — включить кнопки под вводом\n"
-        "/hide — скрыть кнопки\n"
-        "/cancel — сброс\n"
-        "/edit <id> — редактировать заметку\n"
-        "/delete <id> — удалить запись"
+async def prompt_photos(target: Union[Message, CallbackQuery], state: FSMContext):
+    await state.update_data(new_photos=[])
+    txt = (
+        "📷 Добавить фото? Пришли до 3 фото. "
+        "Когда готов — «Готово» или «Пропустить»."
     )
+    kb = photos_kb().as_markup()
+    if isinstance(target, CallbackQuery):
+        await ui(target, txt, reply_markup=kb)
+    else:
+        await target.answer(txt, reply_markup=kb)
+    await state.set_state(PhotoFlow.photos)
 
 
-async def cancel_cmd(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "Ок, сбросил. Возвращаю в меню.", reply_markup=main_kb().as_markup()
-    )
-
-
-async def menu_cmd(message: Message):
-    await message.answer(
-        "Включил кнопки под полем ввода.", reply_markup=reply_main_kb()
-    )
-
-
-async def hide_cmd(message: Message):
-    await message.answer("Скрываю кнопки.", reply_markup=ReplyKeyboardRemove())
-
-
-async def reply_buttons_router(message: Message, state: FSMContext):
-    t = (message.text or "").strip()
-    if (
-        t.endswith("Новая дегустация")
-        or t == "Новая дегустация"
-        or t == "📝 Новая дегустация"
-    ):
-        await new_cmd(message, state)
-    elif (
-        t.endswith("Найти записи")
-        or t == "Найти записи"
-        or t == "🔎 Найти записи"
-    ):
-        await find_cmd(message)
-    elif "Последние 5" in t:
-        await last_cmd(message)
-    elif "О боте" in t:
+async def photo_add(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos: List[str] = data.get("new_photos", []) or []
+    if not message.photo:
         await message.answer(
-            "Здесь можно создать новую запись или найти уже созданную.",
-            reply_markup=main_kb().as_markup(),
+            "Пришли фото (или жми «Готово» / «Пропустить»)."
         )
-    elif t == "Отмена":
-        await cancel_cmd(message, state)
+        return
+    if len(photos) >= 3:
+        await message.answer("Лимит 3 фото. Жми «Готово» или «Пропустить».")
+        return
+    fid = message.photo[-1].file_id
+    photos.append(fid)
+    await state.update_data(new_photos=photos)
+    await message.answer(
+        f"Фото сохранено ({len(photos)}/3). Можешь прислать ещё или нажми «Готово»."
+    )
 
 
-async def about_cb(call: CallbackQuery):
-    await show_main_menu_as_photo(call.message.bot, call.message.chat.id)
+async def photos_done(call: CallbackQuery, state: FSMContext):
+    await finalize_save(call.message, state)
     await call.answer()
 
 
-async def back_main(call: CallbackQuery):
-    await show_main_menu_as_photo(call.message.bot, call.message.chat.id)
+async def photos_skip(call: CallbackQuery, state: FSMContext):
+    await state.update_data(new_photos=[])
+    await finalize_save(call.message, state)
     await call.answer()
 
 
-# ---------------- НОВАЯ ЗАПИСЬ ----------------
+async def show_pics(call: CallbackQuery):
+    try:
+        _, sid = call.data.split(":", 1)
+        tid = int(sid)
+    except Exception:
+        await call.answer()
+        return
 
+    with SessionLocal() as s:
+        t = s.get(Tasting, tid)
+        if not t:
+            await ui(call, "Запись не найдена.")
+            await call.answer()
+            return
+        pics = [p.file_id for p in (t.photos or [])]
 
-async def new_cmd(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    u = get_or_create_user(uid)
-    await start_new(state, uid, u.tz_offset_min or 0)
-    await message.answer("🍵 Название чая?")
+    if not pics:
+        await ui(call, "Фото нет.")
+        await call.answer()
+        return
 
-
-async def new_cb(call: CallbackQuery, state: FSMContext):
-    uid = call.from_user.id
-    u = get_or_create_user(uid)
-    await start_new(state, uid, u.tz_offset_min or 0)
-    await ui(call, "🍵 Название чая?")
+    if len(pics) == 1:
+        await call.message.answer_photo(pics[0])
+    else:
+        media = [InputMediaPhoto(media=fid) for fid in pics[:10]]
+        await call.message.bot.send_media_group(call.message.chat.id, media)
     await call.answer()
 
 
-async def start_new(state: FSMContext, uid: int, tz_offset_min: int):
+# ---------------- СОЗДАНИЕ НОВОЙ ЗАПИСИ (опросник) ----------------
+
+async def start_new(state: FSMContext, uid: int):
     await state.clear()
     await state.update_data(
         user_id=uid,
-        tz_offset_min=tz_offset_min,
         infusions=[],
         effects=[],
         scenarios=[],
@@ -800,10 +803,26 @@ async def start_new(state: FSMContext, uid: int, tz_offset_min: int):
     await state.set_state(NewTasting.name)
 
 
+async def new_cmd(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    get_or_create_user(uid)  # создадим запись юзера (для таймзоны)
+    await start_new(state, uid)
+    await message.answer("🍵 Название чая?")
+
+
+async def new_cb(call: CallbackQuery, state: FSMContext):
+    uid = call.from_user.id
+    get_or_create_user(uid)
+    await start_new(state, uid)
+    await ui(call, "🍵 Название чая?")
+    await call.answer()
+
+
 async def name_in(message: Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await message.answer(
-        "📅 Год сбора? Можно пропустить.", reply_markup=skip_kb("year").as_markup()
+        "📅 Год сбора? Можно пропустить.",
+        reply_markup=skip_kb("year").as_markup(),
     )
     await state.set_state(NewTasting.year)
 
@@ -824,7 +843,8 @@ async def year_in(message: Message, state: FSMContext):
     year = int(txt) if txt.isdigit() else None
     await state.update_data(year=year)
     await message.answer(
-        "🗺️ Регион? Можно пропустить.", reply_markup=skip_kb("region").as_markup()
+        "🗺️ Регион? Можно пропустить.",
+        reply_markup=skip_kb("region").as_markup(),
     )
     await state.set_state(NewTasting.region)
 
@@ -839,7 +859,9 @@ async def region_skip(call: CallbackQuery, state: FSMContext):
 async def region_in(message: Message, state: FSMContext):
     region = message.text.strip()
     await state.update_data(region=region if region else None)
-    await message.answer("🏷️ Категория?", reply_markup=category_kb().as_markup())
+    await message.answer(
+        "🏷️ Категория?", reply_markup=category_kb().as_markup()
+    )
     await state.set_state(NewTasting.category)
 
 
@@ -859,7 +881,9 @@ async def cat_custom_in(message: Message, state: FSMContext):
     data = await state.get_data()
     if not data.get("awaiting_custom_cat"):
         return
-    await state.update_data(category=message.text.strip(), awaiting_custom_cat=False)
+    await state.update_data(
+        category=message.text.strip(), awaiting_custom_cat=False
+    )
     await ask_optional_grams_msg(message, state)
 
 
@@ -874,7 +898,8 @@ async def ask_optional_grams_edit(call: CallbackQuery, state: FSMContext):
 
 async def ask_optional_grams_msg(message: Message, state: FSMContext):
     await message.answer(
-        "⚖️ Граммовка? Можно пропустить.", reply_markup=skip_kb("grams").as_markup()
+        "⚖️ Граммовка? Можно пропустить.",
+        reply_markup=skip_kb("grams").as_markup(),
     )
     await state.set_state(NewTasting.grams)
 
@@ -898,7 +923,8 @@ async def grams_in(message: Message, state: FSMContext):
         grams = None
     await state.update_data(grams=grams)
     await message.answer(
-        "🌡️ Температура, °C? Можно пропустить.", reply_markup=skip_kb("temp").as_markup()
+        "🌡️ Температура, °C? Можно пропустить.",
+        reply_markup=skip_kb("temp").as_markup(),
     )
     await state.set_state(NewTasting.temp_c)
 
@@ -908,7 +934,8 @@ async def temp_skip(call: CallbackQuery, state: FSMContext):
     now_hm = get_user_now_hm(call.from_user.id)
     await ui(
         call,
-        f"⏰ Время дегустации? Сейчас {now_hm}. Введи HH:MM, нажми «Текущее время» или пропусти.",
+        f"⏰ Время дегустации? Сейчас {now_hm}. "
+        "Введи HH:MM, нажми «Текущее время» или пропусти.",
         reply_markup=time_kb().as_markup(),
     )
     await state.set_state(NewTasting.tasted_at)
@@ -923,9 +950,11 @@ async def temp_in(message: Message, state: FSMContext):
     except Exception:
         temp_val = None
     await state.update_data(temp_c=temp_val)
+
     now_hm = get_user_now_hm(message.from_user.id)
     await message.answer(
-        f"⏰ Время дегустации? Сейчас {now_hm}. Введи HH:MM, нажми «Текущее время» или пропусти.",
+        f"⏰ Время дегустации? Сейчас {now_hm}. "
+        "Введи HH:MM, нажми «Текущее время» или пропусти.",
         reply_markup=time_kb().as_markup(),
     )
     await state.set_state(NewTasting.tasted_at)
@@ -959,7 +988,8 @@ async def tasted_at_in(message: Message, state: FSMContext):
     ta = text_val[:5] if ":" in text_val else None
     await state.update_data(tasted_at=ta)
     await message.answer(
-        "🍶 Посудa дегустации? Можно пропустить.", reply_markup=skip_kb("gear").as_markup()
+        "🍶 Посудa дегустации? Можно пропустить.",
+        reply_markup=skip_kb("gear").as_markup(),
     )
     await state.set_state(NewTasting.gear)
 
@@ -975,8 +1005,7 @@ async def gear_in(message: Message, state: FSMContext):
     await ask_aroma_dry_msg(message, state)
 
 
-# --- Ароматы: мультивыбор + «Другое»
-
+# --- ароматы (мультивыбор с "Другое")
 
 async def ask_aroma_dry_msg(message: Message, state: FSMContext):
     await state.update_data(aroma_dry_sel=[])
@@ -1004,8 +1033,7 @@ async def aroma_dry_toggle(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected = data.get("aroma_dry_sel", [])
     if tail == "done":
-        text_val = ", ".join(selected) if selected else None
-        await state.update_data(aroma_dry=text_val)
+        await state.update_data(aroma_dry=", ".join(selected) if selected else None)
         kb = toggle_list_kb(DESCRIPTORS, [], "aw", include_other=True)
         await ui(
             call,
@@ -1059,8 +1087,9 @@ async def aroma_warmed_toggle(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected = data.get("aroma_warmed_sel", [])
     if tail == "done":
-        text_val = ", ".join(selected) if selected else None
-        await state.update_data(aroma_warmed=text_val)
+        await state.update_data(
+            aroma_warmed=", ".join(selected) if selected else None
+        )
         kb = toggle_list_kb(DESCRIPTORS, [], "aa", include_other=True)
         await ui(
             call,
@@ -1114,8 +1143,9 @@ async def aroma_after_toggle(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected = data.get("aroma_after_sel", [])
     if tail == "done":
-        text_val = ", ".join(selected) if selected else None
-        await state.update_data(aroma_after=text_val)
+        await state.update_data(
+            aroma_after=", ".join(selected) if selected else None
+        )
         await start_infusion_block_call(call, state)
         await call.answer()
         return
@@ -1153,8 +1183,7 @@ async def aroma_after_custom(message: Message, state: FSMContext):
     await start_infusion_block_msg(message, state)
 
 
-# --- Проливы
-
+# --- проливы
 
 async def start_infusion_block_msg(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -1243,6 +1272,7 @@ async def taste_toggle(call: CallbackQuery, state: FSMContext):
 
 async def taste_custom(message: Message, state: FSMContext):
     data = await state.get_data()
+    # если человек сразу шлёт текст вместо выбора, просто примем
     if not data.get("awaiting_custom_taste"):
         await state.update_data(cur_taste=message.text.strip() or None)
         await message.answer(
@@ -1251,9 +1281,10 @@ async def taste_custom(message: Message, state: FSMContext):
         )
         await state.set_state(InfusionState.special)
         return
-    text_val = message.text.strip()
+
     await state.update_data(
-        cur_taste=text_val or None, awaiting_custom_taste=False
+        cur_taste=message.text.strip() or None,
+        awaiting_custom_taste=False,
     )
     await message.answer(
         "✨ Особенные ноты пролива? (можно пропустить)",
@@ -1264,7 +1295,8 @@ async def taste_custom(message: Message, state: FSMContext):
 
 async def inf_taste(message: Message, state: FSMContext):
     await state.update_data(
-        cur_taste=message.text.strip() or None, awaiting_custom_taste=False
+        cur_taste=message.text.strip() or None,
+        awaiting_custom_taste=False,
     )
     await message.answer(
         "✨ Особенные ноты пролива? (можно пропустить)",
@@ -1326,9 +1358,9 @@ async def aftertaste_toggle(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected = data.get("cur_aftertaste_sel", [])
     if tail == "done":
-        text_val = ", ".join(selected) if selected else None
         await state.update_data(
-            cur_aftertaste=text_val, awaiting_custom_after=False
+            cur_aftertaste=", ".join(selected) if selected else None,
+            awaiting_custom_after=False,
         )
         await append_current_infusion_and_prompt(call, state)
         await call.answer()
@@ -1360,7 +1392,8 @@ async def aftertaste_custom(message: Message, state: FSMContext):
         await append_current_infusion_and_prompt(message, state)
         return
     await state.update_data(
-        cur_aftertaste=message.text.strip() or None, awaiting_custom_after=False
+        cur_aftertaste=message.text.strip() or None,
+        awaiting_custom_after=False,
     )
     await append_current_infusion_and_prompt(message, state)
 
@@ -1372,7 +1405,9 @@ async def more_infusions(call: CallbackQuery, state: FSMContext):
 async def finish_infusions(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected = data.get("effects", [])
-    kb = toggle_list_kb(EFFECTS, selected, prefix="eff", include_other=True)
+    kb = toggle_list_kb(
+        EFFECTS, selected, prefix="eff", include_other=True
+    )
     await ui(
         call,
         "Ощущения (мультивыбор). Жми пункты, затем «Готово», либо «Другое».",
@@ -1382,8 +1417,7 @@ async def finish_infusions(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# --- Ощущения / Сценарии
-
+# --- ощущения / сценарии / оценка / заметка
 
 async def eff_toggle_or_done(call: CallbackQuery, state: FSMContext):
     _, tail = call.data.split(":", 1)
@@ -1416,7 +1450,9 @@ async def eff_toggle_or_done(call: CallbackQuery, state: FSMContext):
     else:
         selected.append(item)
     await state.update_data(effects=selected)
-    kb = toggle_list_kb(EFFECTS, selected, prefix="eff", include_other=True)
+    kb = toggle_list_kb(
+        EFFECTS, selected, prefix="eff", include_other=True
+    )
     try:
         await call.message.edit_reply_markup(reply_markup=kb.as_markup())
     except TelegramBadRequest:
@@ -1433,9 +1469,12 @@ async def eff_custom(message: Message, state: FSMContext):
     if txt:
         selected.append(txt)
     await state.update_data(effects=selected, awaiting_custom_eff=False)
-    kb = toggle_list_kb(EFFECTS, selected, prefix="eff", include_other=True)
+    kb = toggle_list_kb(
+        EFFECTS, selected, prefix="eff", include_other=True
+    )
     await message.answer(
-        "Добавил. Можешь выбрать ещё и нажать «Готово».", reply_markup=kb.as_markup()
+        "Добавил. Можешь выбрать ещё и нажать «Готово».",
+        reply_markup=kb.as_markup(),
     )
     await state.set_state(EffectsScenarios.effects)
 
@@ -1494,9 +1533,6 @@ async def scn_custom(message: Message, state: FSMContext):
     await state.set_state(EffectsScenarios.scenarios)
 
 
-# --- оценка и заметка
-
-
 async def rate_pick(call: CallbackQuery, state: FSMContext):
     _, val = call.data.split(":", 1)
     await state.update_data(rating=int(val))
@@ -1522,185 +1558,29 @@ async def rating_in(message: Message, state: FSMContext):
 
 
 async def summary_in(message: Message, state: FSMContext):
-    logging.info("summary_in -> prompt_photos")
     await state.update_data(summary=message.text.strip())
     await prompt_photos(message, state)
 
 
 async def summary_skip(call: CallbackQuery, state: FSMContext):
-    logging.info("summary_skip -> prompt_photos")
     await state.update_data(summary=None)
     await prompt_photos(call, state)
     await call.answer()
 
 
-async def prompt_photos(target: Union[Message, CallbackQuery], state: FSMContext):
-    await state.update_data(new_photos=[])
-    txt = (
-        "📷 Добавить фото? Пришли до 3 фото одним или несколькими сообщениями. "
-        "Когда готов — нажми «Готово» или «Пропустить»."
-    )
-    kb = photos_kb().as_markup()
-    if isinstance(target, CallbackQuery):
-        await ui(target, txt, reply_markup=kb)
-    else:
-        await target.answer(txt, reply_markup=kb)
-    await state.set_state(PhotoFlow.photos)
+# ---------------- ПОИСК / ЛЕНТА ----------------
+
+SEARCH_CTX: Dict[str, dict] = {}
 
 
-async def finalize_save(target_message: Message, state: FSMContext):
-    data = await state.get_data()
-    t = Tasting(
-        user_id=data.get("user_id"),
-        tz_offset_min=data.get("tz_offset_min"),
-        name=data.get("name"),
-        year=data.get("year"),
-        region=data.get("region"),
-        category=data.get("category"),
-        grams=data.get("grams"),
-        temp_c=data.get("temp_c"),
-        tasted_at=data.get("tasted_at"),
-        gear=data.get("gear"),
-        aroma_dry=data.get("aroma_dry"),
-        aroma_warmed=data.get("aroma_warmed"),
-        aroma_after=data.get("aroma_after"),
-        effects_csv=",".join(data.get("effects", [])) or None,
-        scenarios_csv=",".join(data.get("scenarios", [])) or None,
-        rating=data.get("rating", 0),
-        summary=data.get("summary") or None,
-    )
-    infusions_data = data.get("infusions", [])
-    new_photos: List[str] = data.get("new_photos", []) or []
-
-    with SessionLocal() as s:
-        s.add(t)
-        s.flush()
-        for inf in infusions_data:
-            s.add(
-                Infusion(
-                    tasting_id=t.id,
-                    n=inf["n"],
-                    seconds=inf["seconds"],
-                    liquor_color=inf["liquor_color"],
-                    taste=inf["taste"],
-                    special_notes=inf["special_notes"],
-                    body=inf["body"],
-                    aftertaste=inf["aftertaste"],
-                )
-            )
-        for fid in new_photos:
-            s.add(Photo(tasting_id=t.id, file_id=fid))
-        s.commit()
-        s.refresh(t)
-        _ = t.photos  # подгрузим список в объект
-
-    await state.clear()
-
-    text_card = build_card_text(t, infusions_data, photo_count=len(new_photos))
-
-    # Если есть фото — пробуем вложить карточку в подпись
-    if new_photos:
-        if len(text_card) <= 1024 and len(new_photos) == 1:
-            # 1 фото + подпись = карточка с кнопками в одном сообщении
-            await target_message.answer_photo(
-                new_photos[0],
-                caption=text_card,
-                reply_markup=card_actions_kb(t.id).as_markup(),
-            )
-        elif len(text_card) <= 1024 and len(new_photos) > 1:
-            # Альбом: caption только у первого элемента; у альбомов нет reply_markup,
-            # поэтому кнопки отправим отдельным сообщением после альбома.
-            media = [InputMediaPhoto(media=new_photos[0], caption=text_card)]
-            media += [InputMediaPhoto(media=fid) for fid in new_photos[1:10]]
-            await target_message.bot.send_media_group(
-                target_message.chat.id, media
-            )
-            await target_message.answer(
-                "Действия:", reply_markup=card_actions_kb(t.id).as_markup()
-            )
-        else:
-            # Текст слишком длинный для подписи — отправим текст отдельно, затем фото
-            await target_message.answer(
-                text_card, reply_markup=card_actions_kb(t.id).as_markup()
-            )
-            if len(new_photos) == 1:
-                await target_message.answer_photo(new_photos[0])
-            else:
-                media = [
-                    InputMediaPhoto(media=fid) for fid in new_photos[:10]
-                ]
-                await target_message.bot.send_media_group(
-                    target_message.chat.id, media
-                )
-    else:
-        # Фото нет — обычная текстовая карточка
-        await target_message.answer(
-            text_card, reply_markup=card_actions_kb(t.id).as_markup()
-        )
+def new_ctx(data: dict) -> str:
+    token = uuid.uuid4().hex[:8]
+    SEARCH_CTX[token] = data
+    return token
 
 
-async def photo_add(message: Message, state: FSMContext):
-    data = await state.get_data()
-    photos: List[str] = data.get("new_photos", []) or []
-    if not message.photo:
-        await message.answer(
-            "Пришли фото (или жми «Готово» / «Пропустить»)."
-        )
-        return
-    if len(photos) >= 3:
-        await message.answer(
-            "Лимит 3 фото. Жми «Готово» или «Пропустить»."
-        )
-        return
-    fid = message.photo[-1].file_id
-    photos.append(fid)
-    await state.update_data(new_photos=photos)
-    await message.answer(
-        f"Фото сохранено ({len(photos)}/3). Можешь прислать ещё или нажми «Готово»."
-    )
-
-
-async def photos_done(call: CallbackQuery, state: FSMContext):
-    await finalize_save(call.message, state)
-    await call.answer()
-
-
-async def photos_skip(call: CallbackQuery, state: FSMContext):
-    await state.update_data(new_photos=[])
-    await finalize_save(call.message, state)
-    await call.answer()
-
-
-async def show_pics(call: CallbackQuery):
-    try:
-        _, sid = call.data.split(":", 1)
-        tid = int(sid)
-    except Exception:
-        await call.answer()
-        return
-
-    with SessionLocal() as s:
-        t = s.get(Tasting, tid)
-        if not t:
-            await ui(call, "Запись не найдена.")
-            await call.answer()
-            return
-        pics = [p.file_id for p in (t.photos or [])]
-
-    if not pics:
-        await ui(call, "Фото нет.")
-        await call.answer()
-        return
-
-    if len(pics) == 1:
-        await call.message.answer_photo(pics[0])
-    else:
-        media = [InputMediaPhoto(media=fid) for fid in pics[:10]]
-        await call.message.bot.send_media_group(call.message.chat.id, media)
-    await call.answer()
-
-
-# ---------------- ПОИСК + ПАГИНАЦИЯ ----------------
+def get_ctx(token: str) -> Optional[dict]:
+    return SEARCH_CTX.get(token)
 
 
 def has_more_last(min_id: int, uid: Optional[int] = None) -> bool:
@@ -1708,14 +1588,12 @@ def has_more_last(min_id: int, uid: Optional[int] = None) -> bool:
         q = select(Tasting.id).where(Tasting.id < min_id)
         if uid is not None:
             q = q.where(Tasting.user_id == uid)
-        x = (
-            s.execute(
-                q.order_by(Tasting.id.desc()).limit(1)
-            )
+        nxt = (
+            s.execute(q.order_by(Tasting.id.desc()).limit(1))
             .scalars()
             .first()
         )
-        return x is not None
+        return nxt is not None
 
 
 async def find_cb(call: CallbackQuery):
@@ -1729,12 +1607,13 @@ async def find_cb(call: CallbackQuery):
 
 async def find_cmd(message: Message):
     await message.answer(
-        "Выбери способ поиска:", reply_markup=search_menu_kb().as_markup()
+        "Выбери способ поиска:",
+        reply_markup=search_menu_kb().as_markup(),
     )
 
 
 async def s_last(call: CallbackQuery):
-    uid = call.from_user.id  # <- кто спрашивает
+    uid = call.from_user.id
 
     with SessionLocal() as s:
         rows = (
@@ -1758,18 +1637,18 @@ async def s_last(call: CallbackQuery):
     await call.message.answer("Последние записи:")
     for t in rows:
         await call.message.answer(
-            short_row(t), reply_markup=open_btn_kb(t.id).as_markup()
+            short_row(t),
+            reply_markup=open_btn_kb(t.id).as_markup(),
         )
 
     min_id = rows[-1].id
-
-    # проверяем есть ли ещё, и предлагаем "Показать ещё"
     if has_more_last(min_id, uid):
         payload = f"{uid}:{min_id}"
         await call.message.answer(
             "Показать ещё:",
             reply_markup=more_btn_kb("last", payload).as_markup(),
         )
+
     await call.message.answer(
         "Ещё варианты:", reply_markup=search_menu_kb().as_markup()
     )
@@ -1789,6 +1668,7 @@ async def last_cmd(message: Message):
             .scalars()
             .all()
         )
+
     if not rows:
         await message.answer(
             "Пока пусто.", reply_markup=search_menu_kb().as_markup()
@@ -1798,8 +1678,10 @@ async def last_cmd(message: Message):
     await message.answer("Последние записи:")
     for t in rows:
         await message.answer(
-            short_row(t), reply_markup=open_btn_kb(t.id).as_markup()
+            short_row(t),
+            reply_markup=open_btn_kb(t.id).as_markup(),
         )
+
     min_id = rows[-1].id
     if has_more_last(min_id, uid):
         payload = f"{uid}:{min_id}"
@@ -1807,20 +1689,23 @@ async def last_cmd(message: Message):
             "Показать ещё:",
             reply_markup=more_btn_kb("last", payload).as_markup(),
         )
+
     await message.answer(
         "Ещё варианты:", reply_markup=search_menu_kb().as_markup()
     )
 
 
 async def more_last(call: CallbackQuery):
+    # more:last:<uid>:<cursor>
     _, _, payload = call.data.split(":", 2)
     try:
         uid_str, cursor_str = payload.split(":", 1)
-        cursor = int(cursor_str)
         uid = int(uid_str)
+        cursor = int(cursor_str)
     except Exception:
         await call.answer()
         return
+
     with SessionLocal() as s:
         rows = (
             s.execute(
@@ -1847,8 +1732,10 @@ async def more_last(call: CallbackQuery):
 
     for t in rows:
         await call.message.answer(
-            short_row(t), reply_markup=open_btn_kb(t.id).as_markup()
+            short_row(t),
+            reply_markup=open_btn_kb(t.id).as_markup(),
         )
+
     min_id = rows[-1].id
     if has_more_last(min_id, uid):
         payload2 = f"{uid}:{min_id}"
@@ -1856,11 +1743,11 @@ async def more_last(call: CallbackQuery):
             "Показать ещё:",
             reply_markup=more_btn_kb("last", payload2).as_markup(),
         )
+
     await call.answer()
 
 
-# --- По названию
-
+# --- поиск по названию
 
 async def s_name(call: CallbackQuery, state: FSMContext):
     await ui(call, "Введи часть названия чая:")
@@ -1871,7 +1758,9 @@ async def s_name(call: CallbackQuery, state: FSMContext):
 async def s_name_run(message: Message, state: FSMContext):
     q = message.text.strip()
     uid = message.from_user.id
+
     token = new_ctx({"type": "name", "q": q, "uid": uid})
+
     with SessionLocal() as s:
         rows = (
             s.execute(
@@ -1886,20 +1775,25 @@ async def s_name_run(message: Message, state: FSMContext):
             .scalars()
             .all()
         )
+
     await state.clear()
 
     if not rows:
         await message.answer(
-            "Ничего не нашёл.", reply_markup=search_menu_kb().as_markup()
+            "Ничего не нашёл.",
+            reply_markup=search_menu_kb().as_markup(),
         )
         return
 
     await message.answer("Найдено:")
     for t in rows:
         await message.answer(
-            short_row(t), reply_markup=open_btn_kb(t.id).as_markup()
+            short_row(t),
+            reply_markup=open_btn_kb(t.id).as_markup(),
         )
+
     min_id = rows[-1].id
+
     with SessionLocal() as s:
         more = (
             s.execute(
@@ -1916,6 +1810,7 @@ async def s_name_run(message: Message, state: FSMContext):
             .first()
             is not None
         )
+
     if more:
         await message.answer(
             "Показать ещё:",
@@ -1923,19 +1818,22 @@ async def s_name_run(message: Message, state: FSMContext):
                 "name", f"{token}:{min_id}"
             ).as_markup(),
         )
+
     await message.answer(
         "Ещё варианты:", reply_markup=search_menu_kb().as_markup()
     )
 
 
 async def more_name(call: CallbackQuery):
-    _, _, payload = call.data.split(":", 2)  # name: token:min_id
+    # more:name:<token>:<cursor>
+    _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
         cursor = int(sid)
     except Exception:
         await call.answer()
         return
+
     ctx = get_ctx(token)
     if not ctx or ctx.get("type") != "name":
         try:
@@ -1948,8 +1846,10 @@ async def more_name(call: CallbackQuery):
         )
         await call.answer()
         return
+
     q = ctx["q"]
     uid = ctx["uid"]
+
     with SessionLocal() as s:
         rows = (
             s.execute(
@@ -1973,16 +1873,20 @@ async def more_name(call: CallbackQuery):
 
     if not rows:
         await call.message.answer(
-            "Больше результатов нет.", reply_markup=search_menu_kb().as_markup()
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
         )
         await call.answer()
         return
 
     for t in rows:
         await call.message.answer(
-            short_row(t), reply_markup=open_btn_kb(t.id).as_markup()
+            short_row(t),
+            reply_markup=open_btn_kb(t.id).as_markup(),
         )
+
     min_id = rows[-1].id
+
     with SessionLocal() as s:
         more = (
             s.execute(
@@ -2006,17 +1910,16 @@ async def more_name(call: CallbackQuery):
                 "name", f"{token}:{min_id}"
             ).as_markup(),
         )
+
     await call.answer()
 
 
-# --- По категории / по году / расширенный
-# Чтобы не ломалось меню, сделаем простые версии.
-
+# --- заглушки для остальных пунктов меню поиска
 
 async def s_cat(call: CallbackQuery, state: FSMContext):
     await ui(
         call,
-        "Поиск по категории пока не реализован. Используй поиск по названию или 'Последние 5'.",
+        "Поиск по категории пока не реализован. Используй поиск по названию или «Последние 5».",
         reply_markup=search_menu_kb().as_markup(),
     )
     await state.clear()
@@ -2026,7 +1929,7 @@ async def s_cat(call: CallbackQuery, state: FSMContext):
 async def s_year(call: CallbackQuery, state: FSMContext):
     await ui(
         call,
-        "Поиск по году пока не реализован. Используй поиск по названию или 'Последние 5'.",
+        "Поиск по году пока не реализован. Используй поиск по названию или «Последние 5».",
         reply_markup=search_menu_kb().as_markup(),
     )
     await state.clear()
@@ -2043,8 +1946,7 @@ async def s_adv(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# --- ОТКРЫТИЕ / РЕДАКТИРОВАНИЕ / УДАЛЕНИЕ КАРТОЧКИ -----------------
-
+# ---------------- ОТКРЫТИЕ / РЕДАКТ / УДАЛЕНИЕ ----------------
 
 async def open_card(call: CallbackQuery):
     try:
@@ -2060,7 +1962,7 @@ async def open_card(call: CallbackQuery):
             await call.message.answer("Запись не найдена.")
             await call.answer()
             return
-        # берём проливы
+
         inf_list = (
             s.execute(
                 select(Infusion)
@@ -2082,6 +1984,7 @@ async def open_card(call: CallbackQuery):
             }
             for inf in inf_list
         ]
+
         photo_count = (
             s.execute(
                 select(func.count(Photo.id)).where(Photo.tasting_id == tid)
@@ -2093,23 +1996,24 @@ async def open_card(call: CallbackQuery):
         t, infusions_data, photo_count=photo_count or 0
     )
     await call.message.answer(
-        card_text, reply_markup=card_actions_kb(t.id).as_markup()
+        card_text,
+        reply_markup=card_actions_kb(t.id).as_markup(),
     )
     await call.answer()
 
 
 async def edit_cb(call: CallbackQuery, state: FSMContext):
-    # просим новую заметку
     try:
         _, sid = call.data.split(":", 1)
         tid = int(sid)
     except Exception:
         await call.answer()
         return
+
     await state.update_data(edit_t_id=tid)
     await state.set_state(EditFlow.waiting_text)
     await call.message.answer(
-        "Пришли новый текст заметки (summary). Старое значение перезапишется."
+        "Пришли новый текст заметки. Старое значение перезапишется."
     )
     await call.answer()
 
@@ -2166,8 +2070,7 @@ async def edit_flow_msg(message: Message, state: FSMContext):
     await state.clear()
 
 
-# --- команды /edit и /delete через текст -----------------
-
+# команды /edit и /delete напрямую
 
 async def edit_cmd(message: Message, state: FSMContext):
     parts = (message.text or "").split()
@@ -2178,7 +2081,7 @@ async def edit_cmd(message: Message, state: FSMContext):
     await state.update_data(edit_t_id=tid)
     await state.set_state(EditFlow.waiting_text)
     await message.answer(
-        f"Редактирование #{tid}. Пришли новый текст заметки (summary)."
+        f"Редактирование #{tid}. Пришли новый текст заметки."
     )
 
 
@@ -2194,26 +2097,107 @@ async def delete_cmd(message: Message):
     )
 
 
-# --- /tz настройка часового пояса -----------------
+# ---------------- КОМАНДЫ /start /help /tz и т.п. ----------------
+
+async def show_main_menu_as_photo(bot: Bot, chat_id: int):
+    caption = "Привет! Создать новую запись или найти уже созданную."
+    if cfg.banner_path:
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=FSInputFile(cfg.banner_path),
+            caption=caption,
+            reply_markup=main_kb().as_markup(),
+        )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            reply_markup=main_kb().as_markup(),
+        )
+
+
+async def on_start(message: Message):
+    await show_main_menu_as_photo(message.bot, message.chat.id)
+
+
+async def help_cmd(message: Message):
+    await message.answer(
+        "/start — меню\n"
+        "/new — новая дегустация\n"
+        "/find — поиск\n"
+        "/last — последние 5\n"
+        "/tz — часовой пояс\n"
+        "/menu — включить кнопки под вводом\n"
+        "/hide — скрыть кнопки\n"
+        "/cancel — сброс\n"
+        "/edit <id> — редактировать заметку\n"
+        "/delete <id> — удалить запись"
+    )
+
+
+async def cancel_cmd(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Ок, сбросил. Возвращаю в меню.",
+        reply_markup=main_kb().as_markup(),
+    )
+
+
+async def menu_cmd(message: Message):
+    await message.answer(
+        "Включил кнопки под полем ввода.",
+        reply_markup=reply_main_kb(),
+    )
+
+
+async def hide_cmd(message: Message):
+    await message.answer("Скрываю кнопки.", reply_markup=ReplyKeyboardRemove())
+
+
+async def reply_buttons_router(message: Message, state: FSMContext):
+    t = (message.text or "").strip()
+    if "Новая дегустация" in t:
+        await new_cmd(message, state)
+    elif "Найти записи" in t:
+        await find_cmd(message)
+    elif "Последние 5" in t:
+        await last_cmd(message)
+    elif "О боте" in t:
+        await message.answer(
+            "Здесь можно создать новую запись или найти уже созданную.",
+            reply_markup=main_kb().as_markup(),
+        )
+    elif t == "Отмена":
+        await cancel_cmd(message, state)
+
+
+async def about_cb(call: CallbackQuery):
+    await show_main_menu_as_photo(call.message.bot, call.message.chat.id)
+    await call.answer()
+
+
+async def back_main(call: CallbackQuery):
+    await show_main_menu_as_photo(call.message.bot, call.message.chat.id)
+    await call.answer()
 
 
 async def tz_cmd(message: Message):
     """
-    /tz                -> показать какой сейчас UTC±X и объяснить синтаксис
-    /tz +3   или /tz -5.5  -> сохранить
+    /tz -> показать текущий сдвиг
+    /tz +3    /tz -5.5 -> сохранить новый сдвиг
     """
     parts = (message.text or "").split(maxsplit=1)
     uid = message.from_user.id
 
-    # только показать
+    # просто посмотреть
     if len(parts) == 1:
         u = get_or_create_user(uid)
         hours_float = (u.tz_offset_min or 0) / 60.0
         sign = "+" if hours_float >= 0 else ""
         await message.answer(
-            "Смещение твоей локальной зоны относительно UTC сейчас: "
+            "Твой локальный сдвиг (UTC): "
             f"UTC{sign}{hours_float:g}\n\n"
-            "Хочешь поменять? Пришли например:\n"
+            "Чтобы поменять:\n"
             "/tz +3\n"
             "/tz -5.5"
         )
@@ -2232,11 +2216,13 @@ async def tz_cmd(message: Message):
     offset_min = int(round(hours_float * 60))
     set_user_tz(uid, offset_min)
     sign = "+" if hours_float >= 0 else ""
-    await message.answer(f"Запомнил UTC{sign}{hours_float:g}. Буду показывать локальное время.")
+    await message.answer(
+        f"Запомнил UTC{sign}{hours_float:g}. "
+        "Теперь буду подставлять твоё локальное время."
+    )
 
 
-# ---------------- РЕГИСТРАЦИЯ ХЭНДЛЕРОВ ----------------
-
+# ---------------- РЕГИСТРАЦИЯ ХЭНДЛЕРОВ В DISPATCHER ----------------
 
 def setup_handlers(dp: Dispatcher):
     # команды
@@ -2252,10 +2238,10 @@ def setup_handlers(dp: Dispatcher):
     dp.message.register(delete_cmd, Command("delete"))
     dp.message.register(tz_cmd, Command("tz"))
 
-    # reply-кнопки (fallback)
+    # reply-кнопки под полем ввода
     dp.message.register(reply_buttons_router)
 
-    # --- stateful ввод новой дегустации
+    # опросник новой дегустации
     dp.message.register(name_in, NewTasting.name)
     dp.message.register(year_in, NewTasting.year)
     dp.message.register(region_in, NewTasting.region)
@@ -2286,10 +2272,10 @@ def setup_handlers(dp: Dispatcher):
     # поиск
     dp.message.register(s_name_run, SearchFlow.name)
 
-    # edit flow
+    # редактирование заметки
     dp.message.register(edit_flow_msg, EditFlow.waiting_text)
 
-    # --- callbacks
+    # callbacks
     dp.callback_query.register(new_cb, F.data == "new")
     dp.callback_query.register(find_cb, F.data == "find")
     dp.callback_query.register(about_cb, F.data == "about")
@@ -2326,7 +2312,7 @@ def setup_handlers(dp: Dispatcher):
     dp.callback_query.register(photos_skip, F.data == "skip:photos")
     dp.callback_query.register(show_pics, F.data.startswith("pics:"))
 
-    # поиск
+    # поиск / пагинация
     dp.callback_query.register(s_last, F.data == "s_last")
     dp.callback_query.register(s_name, F.data == "s_name")
     dp.callback_query.register(s_cat, F.data == "s_cat")
@@ -2358,7 +2344,6 @@ async def set_bot_commands(bot: Bot):
 
 # ---------------- MAIN ----------------
 
-
 async def main():
     global cfg
     cfg = get_settings()
@@ -2366,7 +2351,6 @@ async def main():
 
     bot = Bot(cfg.token)
     dp = Dispatcher()
-
     setup_handlers(dp)
     await set_bot_commands(bot)
 
