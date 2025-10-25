@@ -15,6 +15,7 @@ from aiogram.types import (
     InputMediaPhoto,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+    # fmt: off
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
@@ -35,6 +36,7 @@ from sqlalchemy.orm import (
     relationship,
     sessionmaker,
 )
+# fmt: on
 
 # ---------------- ЛОГИ ----------------
 
@@ -111,8 +113,8 @@ class Tasting(Base):
     gear: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
 
     aroma_dry: Mapped[Optional[str]] = mapped_column(nullable=True)
-    aroma_warmed: Mapped[Optional[str]] = mapped_column(nullable=True)   # теперь сюда кладём «прогретый/промытый»
-    aroma_after: Mapped[Optional[str]] = mapped_column(nullable=True)    # не используем, оставляем None
+    aroma_warmed: Mapped[Optional[str]] = mapped_column(nullable=True)   # объединённый «прогретый/промытый»
+    aroma_after: Mapped[Optional[str]] = mapped_column(nullable=True)    # оставлено для совместимости
 
     effects_csv: Mapped[Optional[str]] = mapped_column(
         String(300), nullable=True
@@ -177,10 +179,24 @@ SessionLocal = None  # фабрика сессий
 def setup_db(db_url: str):
     """
     Создаёт таблицы, если их нет.
-    Важно: не мигрирует существующие (мы без Alembic), поэтому избегаем ломающих изменений.
+    + Твики для SQLite: WAL, NORMAL, кэши — меньше блокировок на дешёвом хостинге.
     """
     global SessionLocal
-    engine = create_engine(db_url, echo=False, future=True)
+    engine = create_engine(
+        db_url,
+        echo=False,
+        future=True,
+        connect_args={"check_same_thread": False}  # безопасно и уменьшает «залипания»
+    )
+
+    # PRAGMA для SQLite
+    if db_url.startswith("sqlite"):
+        with engine.connect() as conn:
+            conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+            conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
+            conn.exec_driver_sql("PRAGMA temp_store=MEMORY;")
+            conn.exec_driver_sql("PRAGMA cache_size=-20000;")  # ~20MB кэша
+
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
@@ -188,9 +204,6 @@ def setup_db(db_url: str):
 # ---------------- ЧАСОВОЙ ПОЯС ----------------
 
 def get_or_create_user(uid: int) -> User:
-    """
-    Возвращает или создаёт запись о пользователе (часовой пояс и т.д.).
-    """
     with SessionLocal() as s:
         u = s.get(User, uid)
         if not u:
@@ -206,9 +219,6 @@ def get_or_create_user(uid: int) -> User:
 
 
 def set_user_tz(uid: int, offset_min: int) -> None:
-    """
-    Запомнить сдвиг (в минутах относительно UTC).
-    """
     with SessionLocal() as s:
         u = s.get(User, uid)
         if not u:
@@ -224,10 +234,6 @@ def set_user_tz(uid: int, offset_min: int) -> None:
 
 
 def get_user_now_hm(uid: int) -> str:
-    """
-    Возвращает локальное время пользователя вида HH:MM
-    по сохранённому смещению tz_offset_min.
-    """
     u = get_or_create_user(uid)
     off = u.tz_offset_min or 0
     now_utc = datetime.datetime.utcnow()
@@ -471,7 +477,6 @@ class NewTasting(StatesGroup):
     gear = State()
     aroma_dry = State()
     aroma_warmed = State()   # объединённый шаг «прогретый/промытый»
-    # aroma_after = State()  # Больше не используем, оставлено для совместимости
 
 
 class InfusionState(StatesGroup):
@@ -510,16 +515,9 @@ class EditFlow(StatesGroup):
 # ---------------- ХЭЛПЕРЫ UI ----------------
 
 async def ui(target: Union[CallbackQuery, Message], text: str, reply_markup=None):
-    """
-    Универсальный вывод:
-    - если это callback — пытаемся отредачить предыдущее сообщение,
-      если не получается (альбом и т.д.) — шлём новое.
-    - если это message — просто answer().
-    """
     try:
         if isinstance(target, CallbackQuery):
             msg = target.message
-            # если это было фото с подписью:
             if getattr(msg, "caption", None) is not None or getattr(msg, "photo", None):
                 await msg.edit_caption(caption=text, reply_markup=reply_markup)
             else:
@@ -622,10 +620,6 @@ async def append_current_infusion_and_prompt(msg_or_call, state: FSMContext):
 
 
 async def finalize_save(target_message: Message, state: FSMContext):
-    """
-    Финальная сборка дегустации: создаём Tasting, Infusion, Photo,
-    чистим FSM, отправляем карточку.
-    """
     data = await state.get_data()
     t = Tasting(
         user_id=data.get("user_id"),
@@ -678,14 +672,12 @@ async def finalize_save(target_message: Message, state: FSMContext):
     text_card = build_card_text(t, infusions_data, photo_count=len(new_photos))
 
     if new_photos:
-        # если одно фото и текст влезает в подпись
         if len(new_photos) == 1 and len(text_card) <= 1024:
             await target_message.answer_photo(
                 new_photos[0],
                 caption=text_card,
                 reply_markup=card_actions_kb(t.id).as_markup(),
             )
-        # если несколько фото и подпись ок
         elif len(new_photos) > 1 and len(text_card) <= 1024:
             media = [InputMediaPhoto(media=new_photos[0], caption=text_card)]
             media += [InputMediaPhoto(media=fid) for fid in new_photos[1:10]]
@@ -696,7 +688,6 @@ async def finalize_save(target_message: Message, state: FSMContext):
                 "Действия:", reply_markup=card_actions_kb(t.id).as_markup()
             )
         else:
-            # длинный текст карточки
             await target_message.answer(
                 text_card, reply_markup=card_actions_kb(t.id).as_markup()
             )
@@ -708,7 +699,6 @@ async def finalize_save(target_message: Message, state: FSMContext):
                     target_message.chat.id, media
                 )
     else:
-        # без фото — просто текст
         await target_message.answer(
             text_card, reply_markup=card_actions_kb(t.id).as_markup()
         )
@@ -1009,7 +999,7 @@ async def gear_in(message: Message, state: FSMContext):
     await ask_aroma_dry_msg(message, state)
 
 
-# --- ароматы (мультивыбор с "Другое"). Объединено: «прогретый/промытый» в один шаг.
+# --- ароматы
 
 async def ask_aroma_dry_msg(message: Message, state: FSMContext):
     await state.update_data(aroma_dry_sel=[])
@@ -1220,7 +1210,6 @@ async def taste_toggle(call: CallbackQuery, state: FSMContext):
 
 async def taste_custom(message: Message, state: FSMContext):
     data = await state.get_data()
-    # если человек сразу шлёт текст вместо выбора, просто примем
     if not data.get("awaiting_custom_taste"):
         await state.update_data(cur_taste=message.text.strip() or None)
         await message.answer(
@@ -1644,7 +1633,6 @@ async def last_cmd(message: Message):
 
 
 async def more_last(call: CallbackQuery):
-    # more:last:<uid>:<cursor>
     _, _, payload = call.data.split(":", 2)
     try:
         uid_str, cursor_str = payload.split(":", 1)
@@ -1654,7 +1642,6 @@ async def more_last(call: CallbackQuery):
         await call.answer()
         return
 
-    # защита: чужие uid не разрешаем
     if uid_payload != call.from_user.id:
         try:
             await call.message.edit_reply_markup()
@@ -1786,7 +1773,6 @@ async def s_name_run(message: Message, state: FSMContext):
 
 
 async def more_name(call: CallbackQuery):
-    # more:name:<token>:<cursor>
     _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
@@ -1893,13 +1879,6 @@ async def s_cat_pick(call: CallbackQuery):
 
     if val == "__other__":
         await ui(call, "Введи категорию текстом:")
-        # переиспользуем SearchFlow.category
-        fsm = FSMContext(storage=None, key=None)  # заглушка для типизации
-        # но контекст уже есть у dp — поэтому просто выставим через call.message.bot не нужно.
-        # В aiogram v3 нам нужен state из хендлера — обойдёмся отдельным message-хендлером:
-        # Здесь просто подскажем пользователю прислать текст, а само состояние установлено выше не требуется.
-        # Реальное состояние ставим явным хендлером ниже (см. register).
-        await call.answer()
         return
 
     token = new_ctx({"type": "cat", "cat": val, "uid": uid})
@@ -1955,7 +1934,6 @@ async def s_cat_pick(call: CallbackQuery):
 
 
 async def s_cat_text(message: Message, state: FSMContext):
-    # ручной ввод категории
     q = (message.text or "").strip()
     uid = message.from_user.id
 
@@ -2005,7 +1983,6 @@ async def s_cat_text(message: Message, state: FSMContext):
 
 
 async def more_cat(call: CallbackQuery):
-    # more:cat:<token>:<cursor>
     _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
@@ -2135,7 +2112,6 @@ async def s_year_run(message: Message, state: FSMContext):
 
 
 async def more_year(call: CallbackQuery):
-    # more:year:<token>:<cursor>
     _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
@@ -2255,7 +2231,6 @@ async def rating_filter_pick(call: CallbackQuery):
 
 
 async def more_rating(call: CallbackQuery):
-    # more:rating:<token>:<cursor>
     _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
@@ -2462,8 +2437,6 @@ async def edit_flow_msg(message: Message, state: FSMContext):
     await state.clear()
 
 
-# команды /edit и /delete напрямую
-
 async def edit_cmd(message: Message, state: FSMContext):
     parts = (message.text or "").split()
     if len(parts) < 2 or not parts[1].isdigit():
@@ -2592,7 +2565,6 @@ async def tz_cmd(message: Message):
     parts = (message.text or "").split(maxsplit=1)
     uid = message.from_user.id
 
-    # просто посмотреть
     if len(parts) == 1:
         u = get_or_create_user(uid)
         hours_float = (u.tz_offset_min or 0) / 60.0
@@ -2625,7 +2597,7 @@ async def tz_cmd(message: Message):
     )
 
 
-# ---------------- РЕГИСТРАЦИЯ ХЭНДЛЕРОВ В DISPATCHER ----------------
+# ---------------- РЕГИСТРАЦИЯ ХЭНДЛЕРОВ ----------------
 
 def setup_handlers(dp: Dispatcher):
     # команды
@@ -2641,7 +2613,7 @@ def setup_handlers(dp: Dispatcher):
     dp.message.register(delete_cmd, Command("delete"))
     dp.message.register(tz_cmd, Command("tz"))
 
-    # опросник новой дегустации (STATE-handlers — идут раньше любых «общих» router'ов!)
+    # STATE-хендлеры — раньше любых общих
     dp.message.register(name_in, NewTasting.name)
     dp.message.register(year_in, NewTasting.year)
     dp.message.register(region_in, NewTasting.region)
@@ -2676,7 +2648,7 @@ def setup_handlers(dp: Dispatcher):
     # редактирование заметки
     dp.message.register(edit_flow_msg, EditFlow.waiting_text)
 
-    # reply-кнопки под полем ввода — В САМОМ КОНЦЕ message-хендлеров!
+    # reply-кнопки в самом конце!
     dp.message.register(reply_buttons_router)
 
     # callbacks
@@ -2756,13 +2728,32 @@ async def main():
     cfg = get_settings()
     setup_db(cfg.db_url)
 
+    # Опционально: ускорить event loop, если добавишь uvloop в requirements
+    try:
+        import uvloop  # type: ignore
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:
+        pass
+
     bot = Bot(cfg.token)
+
+    # ВАЖНО: дропаем «хвосты» апдейтов и гарантируем, что нет webhook
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
     dp = Dispatcher()
     setup_handlers(dp)
     await set_bot_commands(bot)
 
     logging.info("Bot started")
-    await dp.start_polling(bot)
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+        polling_timeout=30,
+        handle_signals=True,
+    )
 
 
 if __name__ == "__main__":
