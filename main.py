@@ -2657,6 +2657,9 @@ def setup_handlers(dp: Dispatcher):
     dp.callback_query.register(help_cb, F.data == "help")
     dp.callback_query.register(back_main, F.data == "back:main")
 
+    dp.callback_query.register(cat_pick, F.data.startswith("cat:"))
+    dp.callback_query.register(s_cat_pick, F.data.startswith("scat:"))
+
     dp.callback_query.register(year_skip, F.data == "skip:year")
     dp.callback_query.register(region_skip, F.data == "skip:region")
     dp.callback_query.register(grams_skip, F.data == "skip:grams")
