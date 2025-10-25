@@ -1197,8 +1197,15 @@ async def find_cmd(message: Message):
     await message.answer("Выбери способ поиска:", reply_markup=search_menu_kb().as_markup())
 
 async def s_last(call: CallbackQuery):
+    uid = call.from_user.id  # <- кто спрашивает
     with SessionLocal() as s:
-        rows = s.execute(select(Tasting).order_by(Tasting.id.desc()).limit(PAGE_SIZE)).scalars().all()
+        rows = s.execute(
+            select(Tasting)
+            .where(Tasting.user_id == uid)              # показываем только его дегустации
+            .order_by(Tasting.id.desc())                # последние
+            .limit(PAGE_SIZE)
+        ).scalars().all()
+    # дальше остаётся та же логика формирования текста/кнопок
 
     if not rows:
         await ui(call, "Пока пусто.", reply_markup=search_menu_kb().as_markup())
