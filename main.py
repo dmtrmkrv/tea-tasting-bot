@@ -332,6 +332,23 @@ def reply_main_kb() -> ReplyKeyboardMarkup:
     )
 
 
+async def maybe_reply_kb(
+    state: FSMContext,
+) -> ReplyKeyboardMarkup | ReplyKeyboardRemove | None:
+    data = await state.get_data()
+    if data.get("reply_kb_hidden"):
+        return None
+    return reply_main_kb()
+
+
+async def clear_state_preserving_reply(state: FSMContext) -> bool:
+    data = await state.get_data()
+    hidden = bool(data.get("reply_kb_hidden"))
+    await state.clear()
+    await state.update_data(reply_kb_hidden=hidden)
+    return hidden
+
+
 def category_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     for c in CATEGORIES:
@@ -711,7 +728,7 @@ async def finalize_save(target_message: Message, state: FSMContext):
         s.commit()
         s.refresh(t)
 
-    await state.clear()
+    await clear_state_preserving_reply(state)
 
     text_card = build_card_text(t, infusions_data, photo_count=len(new_photos))
 
@@ -826,7 +843,7 @@ async def show_pics(call: CallbackQuery):
 # ---------------- СОЗДАНИЕ НОВОЙ ЗАПИСИ (опросник) ----------------
 
 async def start_new(state: FSMContext, uid: int):
-    await state.clear()
+    await clear_state_preserving_reply(state)
     await state.update_data(
         user_id=uid,
         infusions=[],
@@ -1788,7 +1805,7 @@ async def s_name_run(message: Message, state: FSMContext):
             "Нужно указать часть названия.",
             reply_markup=search_menu_kb().as_markup(),
         )
-        await state.clear()
+        await clear_state_preserving_reply(state)
         return
     uid = message.from_user.id
 
@@ -1796,7 +1813,7 @@ async def s_name_run(message: Message, state: FSMContext):
     tastings = fetch_user_tastings(uid)
     matches = [t for t in tastings if match_name(t, q_cf)]
 
-    await state.clear()
+    await clear_state_preserving_reply(state)
 
     if not matches:
         await message.answer(
@@ -1944,7 +1961,7 @@ async def s_cat_pick(call: CallbackQuery, state: FSMContext):
     _, val = call.data.split(":", 1)
     uid = call.from_user.id
 
-    await state.clear()
+    await clear_state_preserving_reply(state)
 
     key = "__other__" if val == "__other__" else val
     tastings = fetch_user_tastings(uid)
@@ -1991,14 +2008,14 @@ async def s_cat_text(message: Message, state: FSMContext):
 
     if not q:
         await message.answer("Нужно указать категорию.", reply_markup=search_menu_kb().as_markup())
-        await state.clear()
+        await clear_state_preserving_reply(state)
         return
 
     key = "__other__" if q.casefold() in CUSTOM_CATEGORY_ALIASES else q
     tastings = fetch_user_tastings(uid)
     matches = filter_by_category(tastings, key)
 
-    await state.clear()
+    await clear_state_preserving_reply(state)
 
     if not matches:
         await message.answer("Ничего не нашёл.", reply_markup=search_menu_kb().as_markup())
@@ -2127,7 +2144,7 @@ async def s_year_run(message: Message, state: FSMContext):
     txt = (message.text or "").strip()
     if not txt.isdigit():
         await message.answer("Нужно число, например 2020.", reply_markup=search_menu_kb().as_markup())
-        await state.clear()
+        await clear_state_preserving_reply(state)
         return
     year = int(txt)
     uid = message.from_user.id
@@ -2141,7 +2158,7 @@ async def s_year_run(message: Message, state: FSMContext):
                 .order_by(Tasting.id.desc()).limit(PAGE_SIZE)
             ).scalars().all()
         )
-    await state.clear()
+    await clear_state_preserving_reply(state)
 
     if not rows:
         await message.answer("Ничего не нашёл.", reply_markup=search_menu_kb().as_markup())
@@ -2538,12 +2555,12 @@ async def edit_field_select(call: CallbackQuery, state: FSMContext):
     tid = data.get("edit_t_id")
     if not tid:
         await call.message.answer("Не знаю, что редактировать. Начни заново.")
-        await state.clear()
+        await clear_state_preserving_reply(state)
         await call.answer()
         return
 
     if field == "cancel":
-        await state.clear()
+        await clear_state_preserving_reply(state)
         await call.message.answer("Редактирование отменено.")
         await call.answer()
         return
@@ -2591,7 +2608,7 @@ async def edit_category_pick(call: CallbackQuery, state: FSMContext):
     tid = data.get("edit_t_id")
     if not tid:
         await call.message.answer("Не знаю, что редактировать. Начни заново.")
-        await state.clear()
+        await clear_state_preserving_reply(state)
         await call.answer()
         return
 
@@ -2613,7 +2630,7 @@ async def edit_category_pick(call: CallbackQuery, state: FSMContext):
         await prompt_edit_menu(call, state)
     else:
         await call.message.answer("Не удалось обновить категорию.")
-        await state.clear()
+        await clear_state_preserving_reply(state)
     await call.answer()
 
 
@@ -2622,7 +2639,7 @@ async def edit_rating_pick(call: CallbackQuery, state: FSMContext):
     tid = data.get("edit_t_id")
     if not tid:
         await call.message.answer("Не знаю, что редактировать. Начни заново.")
-        await state.clear()
+        await clear_state_preserving_reply(state)
         await call.answer()
         return
 
@@ -2640,7 +2657,7 @@ async def edit_rating_pick(call: CallbackQuery, state: FSMContext):
         await prompt_edit_menu(call, state)
     else:
         await call.message.answer("Не удалось обновить оценку.")
-        await state.clear()
+        await clear_state_preserving_reply(state)
     await call.answer()
 
 
@@ -2694,7 +2711,7 @@ async def edit_flow_msg(message: Message, state: FSMContext):
     field = data.get("edit_field")
     if not tid or not field:
         await message.answer("Не знаю, что редактировать.")
-        await state.clear()
+        await clear_state_preserving_reply(state)
         return
 
     raw = (message.text or "").strip()
@@ -2776,7 +2793,7 @@ async def edit_flow_msg(message: Message, state: FSMContext):
     success = update_tasting_fields(tid, message.from_user.id, **updates)
     if not success:
         await message.answer("Не удалось сохранить изменения.")
-        await state.clear()
+        await clear_state_preserving_reply(state)
         return
 
     label = EDIT_SUCCESS_LABELS.get(field, "параметр")
@@ -2824,21 +2841,37 @@ async def delete_cmd(message: Message):
 
 # ---------------- КОМАНДЫ /start /help /tz и т.п. ----------------
 
-async def send_reply_menu(bot: Bot, chat_id: int, text: str = "Главное меню под строкой ввода."):
+async def send_reply_menu(
+    bot: Bot,
+    chat_id: int,
+    state: FSMContext,
+    text: str = "Главное меню под строкой ввода.",
+):
+    markup = await maybe_reply_kb(state)
+    if markup is None:
+        return
     await bot.send_message(
         chat_id=chat_id,
         text=text,
-        reply_markup=reply_main_kb(),
+        reply_markup=markup,
     )
 
 
-async def show_main_menu(bot: Bot, chat_id: int):
+async def show_main_menu(bot: Bot, chat_id: int, state: FSMContext | None = None):
     caption = "Привет! Что делаем — создать новую запись или найти уже созданную?"
-    await send_reply_menu(
-        bot,
-        chat_id,
-        "Клавиатура под строкой ввода активирована.",
-    )
+    if state is not None:
+        await send_reply_menu(
+            bot,
+            chat_id,
+            state,
+            "Клавиатура под строкой ввода активирована.",
+        )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Клавиатура под строкой ввода активирована.",
+            reply_markup=reply_main_kb(),
+        )
     await bot.send_message(
         chat_id=chat_id,
         text=caption,
@@ -2846,8 +2879,10 @@ async def show_main_menu(bot: Bot, chat_id: int):
     )
 
 
-async def on_start(message: Message):
-    await show_main_menu(message.bot, message.chat.id)
+async def on_start(message: Message, state: FSMContext):
+    await clear_state_preserving_reply(state)
+    await state.update_data(reply_kb_hidden=False)
+    await show_main_menu(message.bot, message.chat.id, state)
 
 
 async def help_cmd(message: Message):
@@ -2860,25 +2895,32 @@ async def help_cmd(message: Message):
         "/menu — включить кнопки под вводом (сквозное меню)\n"
         "/hide — скрыть кнопки\n"
         "/cancel — сброс текущего действия\n"
+        "/reset — сброс (алиас)\n"
         "/edit <id> — редактировать заметку\n"
         "/delete <id> — удалить запись"
     )
 
 
 async def cancel_cmd(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Ок, сбросил. Возвращаю в меню.")
-    await show_main_menu(message.bot, message.chat.id)
+    await clear_state_preserving_reply(state)
+    reply_markup = await maybe_reply_kb(state)
+    await message.answer(
+        "Ок, сбросил. Возвращаю в меню.",
+        reply_markup=reply_markup,
+    )
+    await show_main_menu(message.bot, message.chat.id, state)
 
 
-async def menu_cmd(message: Message):
+async def menu_cmd(message: Message, state: FSMContext):
+    await state.update_data(reply_kb_hidden=False)
     await message.answer(
         "Включил кнопки под полем ввода.",
         reply_markup=reply_main_kb(),
     )
 
 
-async def hide_cmd(message: Message):
+async def hide_cmd(message: Message, state: FSMContext):
+    await state.update_data(reply_kb_hidden=True)
     await message.answer("Скрываю кнопки.", reply_markup=ReplyKeyboardRemove())
 
 
@@ -2906,6 +2948,7 @@ async def help_cb(call: CallbackQuery):
         "/menu — включить кнопки под вводом (сквозное меню)\n"
         "/hide — скрыть кнопки\n"
         "/cancel — сброс текущего действия\n"
+        "/reset — сброс (алиас)\n"
         "/edit <id> — редактировать заметку\n"
         "/delete <id> — удалить запись",
         reply_markup=search_menu_kb().as_markup(),
@@ -2913,8 +2956,8 @@ async def help_cb(call: CallbackQuery):
     await call.answer()
 
 
-async def back_main(call: CallbackQuery):
-    await show_main_menu(call.message.bot, call.message.chat.id)
+async def back_main(call: CallbackQuery, state: FSMContext):
+    await show_main_menu(call.message.bot, call.message.chat.id, state)
     await call.answer()
 
 
@@ -2963,8 +3006,10 @@ async def tz_cmd(message: Message):
 def setup_handlers(dp: Dispatcher):
     # команды
     dp.message.register(on_start, CommandStart())
-    dp.message.register(help_cmd, Command("help"))
+    dp.message.register(cancel_cmd, F.text.casefold() == "сброс")
     dp.message.register(cancel_cmd, Command("cancel"))
+    dp.message.register(cancel_cmd, Command("reset"))
+    dp.message.register(help_cmd, Command("help"))
     dp.message.register(menu_cmd, Command("menu"))
     dp.message.register(hide_cmd, Command("hide"))
     dp.message.register(new_cmd, Command("new"))
@@ -3084,6 +3129,8 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="find", description="Поиск"),
         BotCommand(command="last", description="Последние 5"),
         BotCommand(command="tz", description="Часовой пояс"),
+        BotCommand(command="cancel", description="Сброс"),
+        BotCommand(command="reset", description="Сброс (алиас)"),
         BotCommand(command="help", description="Помощь"),
     ]
     await bot.set_my_commands(commands)
