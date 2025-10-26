@@ -27,7 +27,6 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     select,
-    func,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -245,7 +244,7 @@ def get_user_now_hm(uid: int) -> str:
 
 CATEGORIES = ["Зелёный", "Белый", "Красный", "Улун", "Шу Пуэр", "Шен Пуэр", "Хэй Ча", "Другое"]
 DEFAULT_CATEGORIES = [c for c in CATEGORIES if c != "Другое"]
-DEFAULT_CATEGORIES_LOWER = [c.lower() for c in DEFAULT_CATEGORIES]
+DEFAULT_CATEGORIES_CF = {c.casefold() for c in DEFAULT_CATEGORIES}
 CUSTOM_CATEGORY_ALIASES = {"другое", "другая", "другая категория", "other"}
 BODY_PRESETS = ["тонкое", "лёгкое", "среднее", "плотное", "маслянистое"]
 
@@ -336,7 +335,8 @@ def reply_main_kb() -> ReplyKeyboardMarkup:
 def category_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     for c in CATEGORIES:
-        kb.button(text=c, callback_data=f"cat:{c}")
+        callback = "cat:__other__" if c == "Другое" else f"cat:{c}"
+        kb.button(text=c, callback_data=callback)
     kb.adjust(2)
     return kb
 
@@ -344,7 +344,8 @@ def category_kb() -> InlineKeyboardBuilder:
 def category_search_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     for c in CATEGORIES:
-        kb.button(text=c, callback_data=f"scat:{c}")
+        callback = "scat:__other__" if c == "Другое" else f"scat:{c}"
+        kb.button(text=c, callback_data=callback)
     kb.adjust(2)
     return kb
 
@@ -584,7 +585,6 @@ def build_card_text(
     photo_count: Optional[int] = None,
 ) -> str:
     lines = [t.title]
-    lines.append(f"🆔 ID: {t.id}")
     lines.append(f"⭐ Оценка: {t.rating}")
     if t.grams is not None:
         lines.append(f"⚖️ Граммовка: {t.grams} г")
@@ -905,7 +905,7 @@ async def region_in(message: Message, state: FSMContext):
 
 async def cat_pick(call: CallbackQuery, state: FSMContext):
     _, val = call.data.split(":", 1)
-    if val == "Другое":
+    if val == "__other__":
         await ui(call, "Введи категорию текстом:")
         await state.update_data(awaiting_custom_cat=True)
         await call.answer()
@@ -1577,13 +1577,38 @@ def has_more_last(min_id: int, uid: Optional[int] = None) -> bool:
         return nxt is not None
 
 
-def cat_query(uid: int, mode: str, cat: Optional[str] = None):
-    q = select(Tasting).where(Tasting.user_id == uid)
-    if mode == "custom":
-        q = q.where(func.lower(Tasting.category).notin_(DEFAULT_CATEGORIES_LOWER))
-    else:
-        q = q.where(func.lower(Tasting.category) == (cat or "").lower())
-    return q
+def fetch_user_tastings(uid: int) -> List[Tasting]:
+    with SessionLocal() as s:
+        return (
+            s.execute(
+                select(Tasting)
+                .where(Tasting.user_id == uid)
+                .order_by(Tasting.id.desc())
+            )
+            .scalars()
+            .all()
+        )
+
+
+def match_name(t: Tasting, q_cf: str) -> bool:
+    return (t.name or "").casefold().find(q_cf) >= 0
+
+
+def is_custom_category(cat: Optional[str]) -> bool:
+    if not cat:
+        return False
+    return cat.casefold() not in DEFAULT_CATEGORIES_CF
+
+
+def filter_by_category(tastings: List[Tasting], key: str) -> List[Tasting]:
+    if key == "__other__":
+        return [t for t in tastings if is_custom_category(t.category)]
+    q_cf = key.casefold()
+    return [
+        t
+        for t in tastings
+        if (t.category or "").casefold() == q_cf
+    ]
 
 
 async def find_cb(call: CallbackQuery):
@@ -1767,27 +1792,13 @@ async def s_name_run(message: Message, state: FSMContext):
         return
     uid = message.from_user.id
 
-    q_lower = q.lower()
-    token = new_ctx({"type": "name", "q": q_lower, "uid": uid})
-
-    with SessionLocal() as s:
-        rows = (
-            s.execute(
-                select(Tasting)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.name).like(f"%{q_lower}%"),
-                )
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            )
-            .scalars()
-            .all()
-        )
+    q_cf = q.casefold()
+    tastings = fetch_user_tastings(uid)
+    matches = [t for t in tastings if match_name(t, q_cf)]
 
     await state.clear()
 
-    if not rows:
+    if not matches:
         await message.answer(
             "Ничего не нашёл.",
             reply_markup=search_menu_kb().as_markup(),
@@ -1795,36 +1806,25 @@ async def s_name_run(message: Message, state: FSMContext):
         return
 
     await message.answer("Найдено:")
-    for t in rows:
+    first_page = matches[:PAGE_SIZE]
+    for t in first_page:
         await message.answer(
             short_row(t),
             reply_markup=open_btn_kb(t.id).as_markup(),
         )
 
-    min_id = rows[-1].id
-
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                select(Tasting.id)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.name).like(f"%{q_lower}%"),
-                    Tasting.id < min_id,
-                )
-                .order_by(Tasting.id.desc())
-                .limit(1)
-            )
-            .scalars()
-            .first()
-            is not None
-        )
-
-    if more:
+    if len(matches) > PAGE_SIZE:
+        ctx = {
+            "type": "name",
+            "uid": uid,
+            "q": q_cf,
+            "ids": [t.id for t in matches],
+        }
+        token = new_ctx(ctx)
         await message.answer(
             "Показать ещё:",
             reply_markup=more_btn_kb(
-                "name", f"{token}:{min_id}"
+                "name", f"{token}:{PAGE_SIZE}"
             ).as_markup(),
         )
 
@@ -1837,7 +1837,7 @@ async def more_name(call: CallbackQuery):
     _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
-        cursor = int(sid)
+        offset = int(sid)
     except Exception:
         await call.answer()
         return
@@ -1855,31 +1855,12 @@ async def more_name(call: CallbackQuery):
         await call.answer()
         return
 
-    q = ctx["q"]
-    uid = ctx["uid"]
-
-    with SessionLocal() as s:
-        rows = (
-            s.execute(
-                select(Tasting)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.name).like(f"%{q}%"),
-                    Tasting.id < cursor,
-                )
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            )
-            .scalars()
-            .all()
-        )
-
-    try:
-        await call.message.edit_reply_markup()
-    except TelegramBadRequest:
-        pass
-
-    if not rows:
+    ids: List[int] = ctx.get("ids", [])
+    if offset >= len(ids):
+        try:
+            await call.message.edit_reply_markup()
+        except TelegramBadRequest:
+            pass
         await call.message.answer(
             "Больше результатов нет.",
             reply_markup=search_menu_kb().as_markup(),
@@ -1887,35 +1868,60 @@ async def more_name(call: CallbackQuery):
         await call.answer()
         return
 
-    for t in rows:
+    next_ids = ids[offset : offset + PAGE_SIZE]
+    if not next_ids:
+        try:
+            await call.message.edit_reply_markup()
+        except TelegramBadRequest:
+            pass
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await call.answer()
+        return
+
+    with SessionLocal() as s:
+        rows = (
+            s.execute(
+                select(Tasting)
+                .where(
+                    Tasting.user_id == call.from_user.id,
+                    Tasting.id.in_(next_ids),
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    rows_by_id = {t.id: t for t in rows}
+    ordered_rows = [rows_by_id[i] for i in next_ids if i in rows_by_id]
+
+    try:
+        await call.message.edit_reply_markup()
+    except TelegramBadRequest:
+        pass
+
+    if not ordered_rows:
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await call.answer()
+        return
+
+    for t in ordered_rows:
         await call.message.answer(
             short_row(t),
             reply_markup=open_btn_kb(t.id).as_markup(),
         )
 
-    min_id = rows[-1].id
-
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                select(Tasting.id)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.name).like(f"%{q}%"),
-                    Tasting.id < min_id,
-                )
-                .order_by(Tasting.id.desc())
-                .limit(1)
-            )
-            .scalars()
-            .first()
-            is not None
-        )
-    if more:
+    next_offset = offset + len(ordered_rows)
+    if next_offset < len(ids):
         await call.message.answer(
             "Показать ещё:",
             reply_markup=more_btn_kb(
-                "name", f"{token}:{min_id}"
+                "name", f"{token}:{next_offset}"
             ).as_markup(),
         )
 
@@ -1938,26 +1944,13 @@ async def s_cat_pick(call: CallbackQuery, state: FSMContext):
     _, val = call.data.split(":", 1)
     uid = call.from_user.id
 
-    mode = "custom" if val == "Другое" else "exact"
-    cat_value = None if mode == "custom" else val
-    token = new_ctx(
-        {"type": "cat", "mode": mode, "cat": cat_value, "uid": uid}
-    )
-
-    with SessionLocal() as s:
-        rows = (
-            s.execute(
-                cat_query(uid, mode, cat_value)
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            )
-            .scalars()
-            .all()
-        )
-
     await state.clear()
 
-    if not rows:
+    key = "__other__" if val == "__other__" else val
+    tastings = fetch_user_tastings(uid)
+    matches = filter_by_category(tastings, key)
+
+    if not matches:
         await call.message.answer(
             "Ничего не нашёл.",
             reply_markup=search_menu_kb().as_markup(),
@@ -1965,31 +1958,29 @@ async def s_cat_pick(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    if mode == "custom":
+    if key == "__other__":
         heading = "Найдено по пользовательским категориям:"
     else:
         heading = f"Найдено по категории «{val}»:"
 
     await call.message.answer(heading)
-    for t in rows:
-        await call.message.answer(short_row(t), reply_markup=open_btn_kb(t.id).as_markup())
-
-    min_id = rows[-1].id
-
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                cat_query(uid, mode, cat_value)
-                .where(Tasting.id < min_id)
-                .order_by(Tasting.id.desc())
-                .limit(1)
-            ).scalars().first()
-            is not None
+    first_page = matches[:PAGE_SIZE]
+    for t in first_page:
+        await call.message.answer(
+            short_row(t), reply_markup=open_btn_kb(t.id).as_markup()
         )
-    if more:
+
+    if len(matches) > PAGE_SIZE:
+        ctx = {
+            "type": "cat",
+            "uid": uid,
+            "key": key,
+            "ids": [t.id for t in matches],
+        }
+        token = new_ctx(ctx)
         await call.message.answer(
             "Показать ещё:",
-            reply_markup=more_btn_kb("cat", f"{token}:{min_id}").as_markup(),
+            reply_markup=more_btn_kb("cat", f"{token}:{PAGE_SIZE}").as_markup(),
         )
     await call.answer()
 
@@ -2003,65 +1994,42 @@ async def s_cat_text(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    if q.casefold() in CUSTOM_CATEGORY_ALIASES:
-        mode = "custom"
-        cat_value = None
-    else:
-        mode = "exact"
-        cat_value = q
-
-    token = new_ctx(
-        {"type": "cat", "mode": mode, "cat": cat_value, "uid": uid}
-    )
-
-    with SessionLocal() as s:
-        rows = (
-            s.execute(
-                cat_query(uid, mode, cat_value)
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            ).scalars().all()
-        )
+    key = "__other__" if q.casefold() in CUSTOM_CATEGORY_ALIASES else q
+    tastings = fetch_user_tastings(uid)
+    matches = filter_by_category(tastings, key)
 
     await state.clear()
 
-    if not rows:
+    if not matches:
         await message.answer("Ничего не нашёл.", reply_markup=search_menu_kb().as_markup())
         return
 
-    if mode == "custom":
+    if key == "__other__":
         heading = "Найдено по пользовательским категориям:"
     else:
         heading = f"Найдено по категории «{q}»:"
 
     await message.answer(heading)
-    for t in rows:
+    first_page = matches[:PAGE_SIZE]
+    for t in first_page:
         await message.answer(short_row(t), reply_markup=open_btn_kb(t.id).as_markup())
 
-    min_id = rows[-1].id
-
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                cat_query(uid, mode, cat_value)
-                .where(Tasting.id < min_id)
-                .order_by(Tasting.id.desc())
-                .limit(1)
-            ).scalars().first()
-            is not None
-        )
-    if more:
-        await message.answer(
-            "Показать ещё:",
-            reply_markup=more_btn_kb("cat", f"{token}:{min_id}").as_markup(),
-        )
+    if len(matches) > PAGE_SIZE:
+        ctx = {
+            "type": "cat",
+            "uid": uid,
+            "key": key,
+            "ids": [t.id for t in matches],
+        }
+        token = new_ctx(ctx)
+        await message.answer("Показать ещё:", reply_markup=more_btn_kb("cat", f"{token}:{PAGE_SIZE}").as_markup())
 
 
 async def more_cat(call: CallbackQuery):
     _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
-        cursor = int(sid)
+        offset = int(sid)
     except Exception:
         await call.answer()
         return
@@ -2079,53 +2047,72 @@ async def more_cat(call: CallbackQuery):
         await call.answer()
         return
 
-    mode = ctx.get("mode", "exact")
-    cat = ctx.get("cat")
-    uid = ctx["uid"]
+    ids: List[int] = ctx.get("ids", [])
+    if offset >= len(ids):
+        try:
+            await call.message.edit_reply_markup()
+        except TelegramBadRequest:
+            pass
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await call.answer()
+        return
+
+    next_ids = ids[offset : offset + PAGE_SIZE]
+    if not next_ids:
+        try:
+            await call.message.edit_reply_markup()
+        except TelegramBadRequest:
+            pass
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await call.answer()
+        return
 
     with SessionLocal() as s:
         rows = (
             s.execute(
-                cat_query(uid, mode, cat)
-                .where(Tasting.id < cursor)
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            ).scalars().all()
+                select(Tasting)
+                .where(
+                    Tasting.user_id == call.from_user.id,
+                    Tasting.id.in_(next_ids),
+                )
+            )
+            .scalars()
+            .all()
         )
+
+    rows_by_id = {t.id: t for t in rows}
+    ordered_rows = [rows_by_id[i] for i in next_ids if i in rows_by_id]
 
     try:
         await call.message.edit_reply_markup()
     except TelegramBadRequest:
         pass
 
-    if not rows:
-        await call.message.answer("Больше результатов нет.", reply_markup=search_menu_kb().as_markup())
+    if not ordered_rows:
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
         await call.answer()
         return
 
-    for t in rows:
+    for t in ordered_rows:
         await call.message.answer(short_row(t), reply_markup=open_btn_kb(t.id).as_markup())
 
-    min_id = rows[-1].id
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                cat_query(uid, mode, cat)
-                .where(Tasting.id < min_id)
-                .order_by(Tasting.id.desc())
-                .limit(1)
-            ).scalars().first()
-            is not None
-        )
-    if more:
+    next_offset = offset + len(ordered_rows)
+    if next_offset < len(ids):
         await call.message.answer(
             "Показать ещё:",
-            reply_markup=more_btn_kb("cat", f"{token}:{min_id}").as_markup(),
+            reply_markup=more_btn_kb("cat", f"{token}:{next_offset}").as_markup(),
         )
     await call.answer()
 
-
-# --- поиск по году
 
 async def s_year(call: CallbackQuery, state: FSMContext):
     await ui(
@@ -2417,18 +2404,47 @@ async def open_card(call: CallbackQuery):
     card_text = build_card_text(
         t, infusions_data, photo_count=len(photo_files)
     )
-    await call.message.answer(
-        card_text,
-        reply_markup=card_actions_kb(t.id).as_markup(),
-    )
+    actions_markup = card_actions_kb(t.id).as_markup()
+    chat_id = call.message.chat.id
+    bot = call.message.bot
+
     if photo_files:
-        if len(photo_files) == 1:
-            await call.message.answer_photo(photo_files[0])
+        if len(card_text) <= 1024:
+            if len(photo_files) == 1:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo_files[0],
+                    caption=card_text,
+                    reply_markup=actions_markup,
+                )
+            else:
+                media = [
+                    InputMediaPhoto(media=photo_files[0], caption=card_text)
+                ]
+                media += [
+                    InputMediaPhoto(media=fid)
+                    for fid in photo_files[1:10]
+                ]
+                await bot.send_media_group(chat_id, media)
+                await call.message.answer(
+                    "Действия:", reply_markup=actions_markup
+                )
         else:
-            media = [InputMediaPhoto(media=fid) for fid in photo_files[:10]]
-            await call.message.bot.send_media_group(
-                call.message.chat.id, media
+            await call.message.answer(
+                card_text, reply_markup=actions_markup
             )
+            if len(photo_files) == 1:
+                await bot.send_photo(chat_id, photo_files[0])
+            else:
+                media = [
+                    InputMediaPhoto(media=fid) for fid in photo_files[:10]
+                ]
+                await bot.send_media_group(chat_id, media)
+    else:
+        await call.message.answer(
+            card_text,
+            reply_markup=actions_markup,
+        )
     await call.answer()
 
 
@@ -2808,8 +2824,21 @@ async def delete_cmd(message: Message):
 
 # ---------------- КОМАНДЫ /start /help /tz и т.п. ----------------
 
+async def send_reply_menu(bot: Bot, chat_id: int, text: str = "Главное меню под строкой ввода."):
+    await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_main_kb(),
+    )
+
+
 async def show_main_menu(bot: Bot, chat_id: int):
     caption = "Привет! Что делаем — создать новую запись или найти уже созданную?"
+    await send_reply_menu(
+        bot,
+        chat_id,
+        "Клавиатура под строкой ввода активирована.",
+    )
     await bot.send_message(
         chat_id=chat_id,
         text=caption,
@@ -2838,10 +2867,8 @@ async def help_cmd(message: Message):
 
 async def cancel_cmd(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "Ок, сбросил. Возвращаю в меню.",
-        reply_markup=main_kb().as_markup(),
-    )
+    await message.answer("Ок, сбросил. Возвращаю в меню.")
+    await show_main_menu(message.bot, message.chat.id)
 
 
 async def menu_cmd(message: Message):
