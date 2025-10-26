@@ -2826,7 +2826,17 @@ COMMANDS_TEXT = "\n".join(f"/{cmd} — {desc.lower()}" for cmd, desc in BOT_COMM
 
 
 async def show_main_menu(target: Union[Message, CallbackQuery]):
-    await ui(target, MAIN_MENU_TEXT, reply_markup=main_kb().as_markup())
+    markup = main_kb().as_markup()
+    if isinstance(target, CallbackQuery):
+        msg = target.message
+        if getattr(msg, "photo", None) or getattr(msg, "caption", None):
+            try:
+                await msg.edit_reply_markup()
+            except TelegramBadRequest:
+                pass
+            await msg.answer(MAIN_MENU_TEXT, reply_markup=markup)
+            return
+    await ui(target, MAIN_MENU_TEXT, reply_markup=markup)
 
 
 async def on_start(message: Message, state: FSMContext):
