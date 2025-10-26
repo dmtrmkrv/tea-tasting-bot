@@ -2813,15 +2813,16 @@ async def delete_cmd(message: Message):
 # ---------------- КОМАНДЫ /start /help /tz и т.п. ----------------
 
 MAIN_MENU_TEXT = "Привет! Что делаем — создать новую запись или найти уже созданную?"
-COMMANDS_TEXT = (
-    "/start — меню\n"
-    "/new — новая дегустация\n"
-    "/find — поиск\n"
-    "/last — последние 5 записей\n"
-    "/tz — настройка часового пояса\n"
-    "/cancel — сброс текущего действия\n"
-    "/help — перечень команд"
-)
+BOT_COMMANDS: List[tuple[str, str]] = [
+    ("start", "Меню"),
+    ("new", "Новая дегустация"),
+    ("find", "Поиск"),
+    ("last", "Последние 5 записей"),
+    ("tz", "Настройка часового пояса"),
+    ("cancel", "Сброс текущего действия"),
+    ("help", "Перечень команд"),
+]
+COMMANDS_TEXT = "\n".join(f"/{cmd} — {desc.lower()}" for cmd, desc in BOT_COMMANDS)
 
 
 async def show_main_menu(target: Union[Message, CallbackQuery]):
@@ -3009,15 +3010,7 @@ def setup_handlers(dp: Dispatcher):
 
 
 async def set_bot_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="Меню"),
-        BotCommand(command="new", description="Новая дегустация"),
-        BotCommand(command="find", description="Поиск"),
-        BotCommand(command="last", description="Последние 5 записей"),
-        BotCommand(command="tz", description="Настройка часового пояса"),
-        BotCommand(command="cancel", description="Сброс текущего действия"),
-        BotCommand(command="help", description="Перечень команд"),
-    ]
+    commands = [BotCommand(command=cmd, description=desc) for cmd, desc in BOT_COMMANDS]
     await bot.set_my_commands(commands)
 
 
