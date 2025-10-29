@@ -543,6 +543,49 @@ def card_actions_kb(t_id: int) -> InlineKeyboardBuilder:
     return kb
 
 
+def edit_fields_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    buttons = [
+        ("Название", "name"),
+        ("Год", "year"),
+        ("Регион", "region"),
+        ("Категория", "category"),
+        ("Граммовка", "grams"),
+        ("Температура", "temp_c"),
+        ("Время", "tasted_at"),
+        ("Посуда", "gear"),
+        ("Аромат (сухой)", "aroma_dry"),
+        ("Аромат (прогретый)", "aroma_warmed"),
+        ("Ощущения", "effects"),
+        ("Сценарии", "scenarios"),
+        ("Оценка", "rating"),
+        ("Заметка", "summary"),
+        ("Отмена", "cancel"),
+    ]
+    for text, field in buttons:
+        kb.button(text=text, callback_data=f"efld:{field}")
+    kb.adjust(2, 2, 2, 2, 2, 2, 2, 1)
+    return kb
+
+
+def edit_category_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for c in CATEGORIES:
+        kb.button(text=c, callback_data=f"ecat:{c}")
+    kb.button(text="Другое (ввести)", callback_data="ecat:__other__")
+    kb.button(text="⬅️ Назад", callback_data="ecat:__back__")
+    kb.adjust(2, 2, 2, 2, 2)
+    return kb
+
+
+def edit_rating_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for value in range(0, 11):
+        kb.button(text=str(value), callback_data=f"erat:{value}")
+    kb.adjust(6, 5)
+    return kb
+
+
 def confirm_del_kb(t_id: int) -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="Да, удалить", callback_data=f"delok:{t_id}")
@@ -604,6 +647,7 @@ class SearchFlow(StatesGroup):
 
 
 class EditFlow(StatesGroup):
+    choosing = State()
     waiting_text = State()
 
 
@@ -728,6 +772,98 @@ def split_text_for_telegram(text: str, limit: int = MESSAGE_LIMIT) -> List[str]:
         if buf:
             final_parts.append(buf)
     return final_parts or [text[:limit]]
+
+
+FIELD_LABELS = {
+    "name": "Название",
+    "year": "Год",
+    "region": "Регион",
+    "category": "Категория",
+    "grams": "Граммовка",
+    "temp_c": "Температура",
+    "tasted_at": "Время",
+    "gear": "Посуда",
+    "aroma_dry": "Аромат (сухой)",
+    "aroma_warmed": "Аромат (прогретый)",
+    "effects": "Ощущения",
+    "scenarios": "Сценарии",
+    "rating": "Оценка",
+    "summary": "Заметка",
+}
+
+
+EDIT_TEXT_FIELDS = {
+    "name": {
+        "prompt": "Пришли новое название.",
+        "allow_clear": False,
+        "column": "name",
+    },
+    "year": {
+        "prompt": "Пришли год (4 цифры) или «-» чтобы очистить.",
+        "allow_clear": True,
+        "column": "year",
+    },
+    "region": {
+        "prompt": "Пришли регион или «-» чтобы очистить.",
+        "allow_clear": True,
+        "column": "region",
+    },
+    "grams": {
+        "prompt": "Пришли граммовку (число) или «-».",
+        "allow_clear": True,
+        "column": "grams",
+    },
+    "temp_c": {
+        "prompt": "Пришли температуру (°C) или «-».",
+        "allow_clear": True,
+        "column": "temp_c",
+    },
+    "tasted_at": {
+        "prompt": "Пришли время в формате HH:MM или «-».",
+        "allow_clear": True,
+        "column": "tasted_at",
+    },
+    "gear": {
+        "prompt": "Пришли посуду или «-».",
+        "allow_clear": True,
+        "column": "gear",
+    },
+    "aroma_dry": {
+        "prompt": "Пришли аромат сухого листа или «-».",
+        "allow_clear": True,
+        "column": "aroma_dry",
+    },
+    "aroma_warmed": {
+        "prompt": "Пришли аромат прогретого/промытого листа или «-».",
+        "allow_clear": True,
+        "column": "aroma_warmed",
+    },
+    "effects": {
+        "prompt": "Пришли ощущения через запятую или «-».",
+        "allow_clear": True,
+        "column": "effects_csv",
+    },
+    "scenarios": {
+        "prompt": "Пришли сценарии через запятую или «-».",
+        "allow_clear": True,
+        "column": "scenarios_csv",
+    },
+    "summary": {
+        "prompt": "Пришли заметку или «-».",
+        "allow_clear": True,
+        "column": "summary",
+    },
+}
+
+
+def edit_menu_text(seq_no: int) -> str:
+    return f"Редактирование #{seq_no}. Выбери поле."
+
+
+def normalize_csv_text(raw: str) -> str:
+    parts = [piece.strip() for piece in raw.split(",")]
+    filtered = [p for p in parts if p]
+    return ", ".join(filtered)
 
 
 async def send_card_with_media(
@@ -2501,6 +2637,74 @@ async def open_card(call: CallbackQuery):
     await call.answer()
 
 
+def prepare_text_edit(field: str, raw: str) -> Tuple[Optional[Union[str, int, float]], Optional[str], Optional[str]]:
+    cfg = EDIT_TEXT_FIELDS[field]
+    text = (raw or "").strip()
+    if not text:
+        return None, cfg["prompt"], None
+
+    if text == "-":
+        if cfg["allow_clear"]:
+            return None, None, cfg["column"]
+        return None, cfg["prompt"], None
+
+    if field == "name":
+        if text == "-":
+            return None, cfg["prompt"], None
+        return text, None, cfg["column"]
+    if field == "year":
+        if len(text) == 4 and text.isdigit():
+            return int(text), None, cfg["column"]
+        return None, "Год должен состоять из 4 цифр. " + cfg["prompt"], None
+    if field == "grams":
+        try:
+            value = float(text.replace(",", "."))
+        except ValueError:
+            return None, "Не удалось распознать число. " + cfg["prompt"], None
+        return value, None, cfg["column"]
+    if field == "temp_c":
+        try:
+            value = int(text)
+        except ValueError:
+            return None, "Используй целое число. " + cfg["prompt"], None
+        return value, None, cfg["column"]
+    if field == "tasted_at":
+        try:
+            datetime.datetime.strptime(text, "%H:%M")
+        except ValueError:
+            return None, "Время должно быть в формате HH:MM. " + cfg["prompt"], None
+        return text, None, cfg["column"]
+    if field in {"effects", "scenarios"}:
+        normalized = normalize_csv_text(text)
+        if not normalized:
+            return None, cfg["prompt"], None
+        return normalized, None, cfg["column"]
+    # остальные текстовые поля — просто сохраняем строку
+    return text, None, cfg["column"]
+
+
+def update_tasting_fields(tid: int, uid: int, **updates) -> bool:
+    if not updates:
+        return False
+    with SessionLocal() as s:
+        t = s.get(Tasting, tid)
+        if not t or t.user_id != uid:
+            return False
+        for key, value in updates.items():
+            setattr(t, key, value)
+        s.commit()
+    return True
+
+
+async def send_edit_menu(target: Union[CallbackQuery, Message], seq_no: int):
+    markup = edit_fields_kb().as_markup()
+    text = edit_menu_text(seq_no)
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text, reply_markup=markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
 async def edit_cb(call: CallbackQuery, state: FSMContext):
     try:
         _, sid = call.data.split(":", 1)
@@ -2515,12 +2719,17 @@ async def edit_cb(call: CallbackQuery, state: FSMContext):
             await call.message.answer("Нет доступа к этой записи.")
             await call.answer()
             return
+        seq_no = t.seq_no
 
-    await state.update_data(edit_t_id=tid)
-    await state.set_state(EditFlow.waiting_text)
-    await call.message.answer(
-        f"Редактирование #{t.seq_no}. Пришли новый текст заметки. Старое значение перезапишется."
+    await state.clear()
+    await state.set_state(EditFlow.choosing)
+    await state.update_data(
+        edit_t_id=tid,
+        edit_seq_no=seq_no,
+        edit_field=None,
+        awaiting_category_text=False,
     )
+    await send_edit_menu(call, seq_no)
     await call.answer()
 
 
@@ -2568,23 +2777,197 @@ async def del_no_cb(call: CallbackQuery):
     await call.answer()
 
 
+async def edit_field_select(call: CallbackQuery, state: FSMContext):
+    try:
+        _, field = call.data.split(":", 1)
+    except ValueError:
+        await call.answer()
+        return
+
+    data = await state.get_data()
+    tid = data.get("edit_t_id")
+    seq_no = data.get("edit_seq_no")
+    if not tid or seq_no is None:
+        await call.message.answer("Контекст редактирования потерян.")
+        await state.clear()
+        await call.answer()
+        return
+
+    if field == "cancel":
+        await call.message.answer("Редактирование отменено.")
+        await state.clear()
+        await show_main_menu(call.message.bot, call.from_user.id)
+        await call.answer()
+        return
+
+    if field == "category":
+        await state.update_data(edit_field="category", awaiting_category_text=False)
+        await call.message.answer(
+            "Выбери категорию:", reply_markup=edit_category_kb().as_markup()
+        )
+        await call.answer()
+        return
+
+    if field == "rating":
+        await state.update_data(edit_field="rating")
+        await call.message.answer(
+            "Выбери оценку:", reply_markup=edit_rating_kb().as_markup()
+        )
+        await call.answer()
+        return
+
+    if field not in EDIT_TEXT_FIELDS:
+        await call.answer()
+        return
+
+    cfg = EDIT_TEXT_FIELDS[field]
+    await state.update_data(edit_field=field, awaiting_category_text=False)
+    await state.set_state(EditFlow.waiting_text)
+    await call.message.answer(cfg["prompt"])
+    await call.answer()
+
+
+async def edit_category_pick(call: CallbackQuery, state: FSMContext):
+    try:
+        _, raw = call.data.split(":", 1)
+    except ValueError:
+        await call.answer()
+        return
+
+    data = await state.get_data()
+    tid = data.get("edit_t_id")
+    seq_no = data.get("edit_seq_no")
+    if not tid or seq_no is None:
+        await call.message.answer("Контекст редактирования потерян.")
+        await state.clear()
+        await call.answer()
+        return
+
+    if raw == "__back__":
+        await state.set_state(EditFlow.choosing)
+        await state.update_data(edit_field=None, awaiting_category_text=False)
+        await send_edit_menu(call, seq_no)
+        await call.answer()
+        return
+
+    if raw == "__other__":
+        await state.update_data(edit_field="category", awaiting_category_text=True)
+        await state.set_state(EditFlow.waiting_text)
+        await call.message.answer("Пришли категорию текстом.")
+        await call.answer()
+        return
+
+    if raw not in CATEGORIES:
+        await call.answer()
+        return
+
+    if len(raw) > 60:
+        await call.message.answer("Категория слишком длинная.")
+        await call.answer()
+        return
+
+    ok = update_tasting_fields(tid, call.from_user.id, category=raw)
+    if not ok:
+        await call.message.answer("Не удалось обновить запись.")
+        await state.clear()
+        await call.answer()
+        return
+
+    await state.clear()
+    await state.set_state(EditFlow.choosing)
+    await state.update_data(edit_field=None, awaiting_category_text=False)
+    await call.message.answer(f"Обновил {FIELD_LABELS['category']}.")
+    await send_edit_menu(call, seq_no)
+    await call.answer()
+
+
+async def edit_rating_pick(call: CallbackQuery, state: FSMContext):
+    try:
+        _, raw = call.data.split(":", 1)
+        rating = int(raw)
+    except Exception:
+        await call.answer()
+        return
+
+    if rating < 0 or rating > 10:
+        await call.answer()
+        return
+
+    data = await state.get_data()
+    tid = data.get("edit_t_id")
+    seq_no = data.get("edit_seq_no")
+    if not tid or seq_no is None:
+        await call.message.answer("Контекст редактирования потерян.")
+        await state.clear()
+        await call.answer()
+        return
+
+    ok = update_tasting_fields(tid, call.from_user.id, rating=rating)
+    if not ok:
+        await call.message.answer("Не удалось обновить запись.")
+        await state.clear()
+        await call.answer()
+        return
+
+    await state.set_state(EditFlow.choosing)
+    await state.update_data(edit_field=None, awaiting_category_text=False)
+    await call.message.answer(f"Обновил {FIELD_LABELS['rating']}.")
+    await send_edit_menu(call, seq_no)
+    await call.answer()
+
+
 async def edit_flow_msg(message: Message, state: FSMContext):
     data = await state.get_data()
     tid = data.get("edit_t_id")
-    if not tid:
+    seq_no = data.get("edit_seq_no")
+    field = data.get("edit_field")
+    awaiting_category = data.get("awaiting_category_text")
+
+    if not tid or seq_no is None or not field:
+        await message.answer("Контекст редактирования потерян.")
+        await state.clear()
+        return
+
+    if field == "category" and awaiting_category:
+        txt = (message.text or "").strip()
+        if not txt or txt == "-":
+            await message.answer("Категория не может быть пустой. Пришли категорию текстом.")
+            return
+        if len(txt) > 60:
+            await message.answer("Категория слишком длинная. Пришли категорию текстом покороче.")
+            return
+        ok = update_tasting_fields(tid, message.from_user.id, category=txt)
+        if not ok:
+            await message.answer("Не удалось обновить запись.")
+            await state.clear()
+            return
+        await state.set_state(EditFlow.choosing)
+        await state.update_data(edit_field=None, awaiting_category_text=False)
+        await message.answer(f"Обновил {FIELD_LABELS['category']}.")
+        await send_edit_menu(message, seq_no)
+        return
+
+    if field not in EDIT_TEXT_FIELDS:
         await message.answer("Не знаю, что редактировать.")
         await state.clear()
         return
-    with SessionLocal() as s:
-        t = s.get(Tasting, tid)
-        if not t or t.user_id != message.from_user.id:
-            await message.answer("Нет доступа к этой записи.")
-            await state.clear()
-            return
-        t.summary = (message.text or "").strip()
-        s.commit()
-    await message.answer(f"Обновил заметку для #{t.seq_no}.")
-    await state.clear()
+
+    value, error, column = prepare_text_edit(field, message.text or "")
+    if error:
+        await message.answer(error)
+        return
+
+    updates = {column: value}
+    ok = update_tasting_fields(tid, message.from_user.id, **updates)
+    if not ok:
+        await message.answer("Не удалось обновить запись.")
+        await state.clear()
+        return
+
+    await state.set_state(EditFlow.choosing)
+    await state.update_data(edit_field=None, awaiting_category_text=False)
+    await message.answer(f"Обновил {FIELD_LABELS[field]}.")
+    await send_edit_menu(message, seq_no)
 
 
 async def edit_cmd(message: Message, state: FSMContext):
@@ -2596,11 +2979,15 @@ async def edit_cmd(message: Message, state: FSMContext):
     if not target:
         await message.answer("Запись не найдена.")
         return
-    await state.update_data(edit_t_id=target.id)
-    await state.set_state(EditFlow.waiting_text)
-    await message.answer(
-        f"Редактирование #{target.seq_no}. Пришли новый текст заметки."
+    await state.clear()
+    await state.set_state(EditFlow.choosing)
+    await state.update_data(
+        edit_t_id=target.id,
+        edit_seq_no=target.seq_no,
+        edit_field=None,
+        awaiting_category_text=False,
     )
+    await send_edit_menu(message, target.seq_no)
 
 
 async def delete_cmd(message: Message):
@@ -2644,7 +3031,7 @@ async def help_cmd(message: Message):
         "/hide — скрыть кнопки\n"
         "/reset — сброс и возврат в меню\n"
         "/cancel — сброс текущего действия\n"
-        "/edit <id или #N> — редактировать заметку\n"
+        "/edit <id или #N> — редактировать запись\n"
         "/delete <id или #N> — удалить запись"
     )
 
@@ -2697,7 +3084,7 @@ async def help_cb(call: CallbackQuery):
         "/hide — скрыть кнопки\n"
         "/reset — сброс и возврат в меню\n"
         "/cancel — сброс текущего действия\n"
-        "/edit <id или #N> — редактировать заметку\n"
+        "/edit <id или #N> — редактировать запись\n"
         "/delete <id или #N> — удалить запись",
         reply_markup=search_menu_kb().as_markup(),
     )
@@ -2799,7 +3186,7 @@ def setup_handlers(dp: Dispatcher):
     dp.message.register(s_cat_text, SearchFlow.category)
     dp.message.register(s_year_run, SearchFlow.year)
 
-    # редактирование заметки
+    # редактирование записи
     dp.message.register(edit_flow_msg, EditFlow.waiting_text)
 
     # reply-кнопки в самом конце!
@@ -2858,9 +3245,14 @@ def setup_handlers(dp: Dispatcher):
     dp.callback_query.register(more_year, F.data.startswith("more:year:"))
     dp.callback_query.register(more_rating, F.data.startswith("more:rating:"))
 
+    # редактирование tasting
+    dp.callback_query.register(edit_field_select, F.data.startswith("efld:"))
+    dp.callback_query.register(edit_category_pick, F.data.startswith("ecat:"))
+    dp.callback_query.register(edit_rating_pick, F.data.startswith("erat:"))
+    dp.callback_query.register(edit_cb, F.data.startswith("edit:"))
+
     # карточка
     dp.callback_query.register(open_card, F.data.startswith("open:"))
-    dp.callback_query.register(edit_cb, F.data.startswith("edit:"))
     dp.callback_query.register(del_cb, F.data.startswith("del:"))
     dp.callback_query.register(del_ok_cb, F.data.startswith("delok:"))
     dp.callback_query.register(del_no_cb, F.data.startswith("delno:"))
