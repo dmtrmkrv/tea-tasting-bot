@@ -1618,15 +1618,30 @@ async def aftertaste_toggle(call: CallbackQuery, state: FSMContext):
 
 
 async def aftertaste_custom(message: Message, state: FSMContext):
+    """
+    Обработка пользовательского текста после выбора 'Другое' в Характере послевкусия.
+    Принимаем строку только если ранее было нажато 'Другое' (awaiting_custom_after=True).
+    После сохранения сразу двигаем сценарий дальше.
+    """
     data = await state.get_data()
+
+    # Текст принимаем только после 'Другое'
     if not data.get("awaiting_custom_after"):
-        await state.update_data(cur_aftertaste=message.text.strip() or None)
-        await append_current_infusion_and_prompt(message, state)
+        await ui(
+            message,
+            "Выбери вариант из списка или нажми «Другое», чтобы ввести свой вариант."
+        )
         return
-    await state.update_data(
-        cur_aftertaste=message.text.strip() or None,
-        awaiting_custom_after=False,
-    )
+
+    txt = (message.text or "").strip()
+    if not txt:
+        await ui(message, "Пусто. Введи характер послевкусия текстом или нажми «Сброс».")
+        return
+
+    # Сохраняем введённый текст и сбрасываем флаг ожидания кастомного ввода
+    await state.update_data(cur_aftertaste=txt, awaiting_custom_after=False)
+
+    # Переходим к следующему шагу (добавляем текущую инфузию и задаём следующий вопрос)
     await append_current_infusion_and_prompt(message, state)
 
 
@@ -2769,6 +2784,7 @@ def setup_handlers(dp: Dispatcher):
     dp.message.register(inf_taste, InfusionState.taste)
     dp.message.register(inf_special, InfusionState.special)
     dp.message.register(inf_body_custom, InfusionState.body)
+    dp.message.register(aftertaste_custom, InfusionState.aftertaste)
 
     dp.message.register(rating_in, RatingSummary.rating)
     dp.message.register(summary_in, RatingSummary.summary)
