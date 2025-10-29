@@ -13,7 +13,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, BotCommand,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, FSInputFile,
-    InputMediaPhoto,
+    InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
     # fmt: off
@@ -45,6 +45,7 @@ from sqlalchemy.orm import (
 # ---------------- ЛОГИ ----------------
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # ---------------- НАСТРОЙКИ ----------------
@@ -2637,6 +2638,84 @@ async def open_card(call: CallbackQuery):
     await call.answer()
 
 
+def edit_context_home_markup() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:home"))
+    return kb
+
+
+async def notify_edit_context_lost(event: Union[CallbackQuery, Message], state: FSMContext):
+    data = await state.get_data()
+    if data.get("edit_ctx_warned"):
+        return
+    await ui(
+        event,
+        "Контекст редактирования потерян.",
+        reply_markup=edit_context_home_markup(),
+    )
+    await state.update_data(edit_ctx_warned=True)
+
+
+async def ensure_edit_context(event: Union[CallbackQuery, Message], state: FSMContext):
+    """
+    Проверяет валидность контекста редактирования.
+    Возвращает dict с { 'tid': int, 'field': Optional[str], 'seq_no': Optional[int] } если валиден.
+    Если контекст потерян — показывает сообщение с кнопкой '⬅️ В меню' (однократно) и возвращает None.
+    """
+    data = await state.get_data()
+    current_state = await state.get_state()
+    editing_states = {EditFlow.choosing.state, EditFlow.waiting_text.state}
+
+    tid = data.get("edit_t_id")
+    field = data.get("edit_field")
+    seq_no = data.get("edit_seq_no")
+
+    if not tid or seq_no is None:
+        if current_state in editing_states:
+            logger.warning(
+                "Edit context missing (state=%s, tid=%s, seq=%s)",
+                current_state,
+                tid,
+                seq_no,
+            )
+            await notify_edit_context_lost(event, state)
+            return None
+        if data.get("edit_ctx_warned"):
+            await state.update_data(edit_ctx_warned=False)
+        return {"tid": tid, "field": field, "seq_no": seq_no}
+
+    if isinstance(event, CallbackQuery):
+        uid = event.from_user.id
+    elif isinstance(event, Message):
+        uid = event.from_user.id
+    else:
+        uid = getattr(getattr(event, "from_user", None), "id", None)
+        if uid is None and hasattr(event, "message"):
+            uid = getattr(event.message.from_user, "id", None)
+
+    if uid is None:
+        logger.warning("Unable to determine user for edit context check (tid=%s)", tid)
+        await notify_edit_context_lost(event, state)
+        return None
+
+    try:
+        with SessionLocal() as s:
+            t = s.get(Tasting, tid)
+            if not t or t.user_id != uid:
+                logger.warning("Edit context invalid owner (tid=%s, uid=%s)", tid, uid)
+                await notify_edit_context_lost(event, state)
+                return None
+    except Exception:
+        logger.exception("Failed to verify edit context (tid=%s)", tid)
+        await notify_edit_context_lost(event, state)
+        return None
+
+    if data.get("edit_ctx_warned"):
+        await state.update_data(edit_ctx_warned=False)
+
+    return {"tid": tid, "field": field, "seq_no": seq_no}
+
+
 def prepare_text_edit(field: str, raw: str) -> Tuple[Optional[Union[str, int, float]], Optional[str], Optional[str]]:
     cfg = EDIT_TEXT_FIELDS[field]
     text = (raw or "").strip()
@@ -2706,6 +2785,11 @@ async def send_edit_menu(target: Union[CallbackQuery, Message], seq_no: int):
 
 
 async def edit_cb(call: CallbackQuery, state: FSMContext):
+    ctx = await ensure_edit_context(call, state)
+    if ctx is None:
+        await call.answer()
+        return
+
     try:
         _, sid = call.data.split(":", 1)
         tid = int(sid)
@@ -2713,24 +2797,30 @@ async def edit_cb(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    with SessionLocal() as s:
-        t = s.get(Tasting, tid)
-        if not t or t.user_id != call.from_user.id:
-            await call.message.answer("Нет доступа к этой записи.")
-            await call.answer()
-            return
-        seq_no = t.seq_no
+    try:
+        with SessionLocal() as s:
+            t = s.get(Tasting, tid)
+            if not t or t.user_id != call.from_user.id:
+                await call.message.answer("Нет доступа к этой записи.")
+                await call.answer()
+                return
+            seq_no = t.seq_no
 
-    await state.clear()
-    await state.set_state(EditFlow.choosing)
-    await state.update_data(
-        edit_t_id=tid,
-        edit_seq_no=seq_no,
-        edit_field=None,
-        awaiting_category_text=False,
-    )
-    await send_edit_menu(call, seq_no)
-    await call.answer()
+        await state.clear()
+        await state.set_state(EditFlow.choosing)
+        await state.update_data(
+            edit_t_id=tid,
+            edit_seq_no=seq_no,
+            edit_field=None,
+            awaiting_category_text=False,
+            edit_ctx_warned=False,
+        )
+        await send_edit_menu(call, seq_no)
+        await call.answer()
+    except Exception:
+        logger.exception("edit flow failed")
+        await notify_edit_context_lost(call, state)
+        await call.answer()
 
 
 async def del_cb(call: CallbackQuery):
@@ -2778,110 +2868,150 @@ async def del_no_cb(call: CallbackQuery):
 
 
 async def edit_field_select(call: CallbackQuery, state: FSMContext):
+    ctx = await ensure_edit_context(call, state)
+    if ctx is None:
+        await call.answer()
+        return
+
     try:
         _, field = call.data.split(":", 1)
     except ValueError:
         await call.answer()
         return
 
-    data = await state.get_data()
-    tid = data.get("edit_t_id")
-    seq_no = data.get("edit_seq_no")
+    tid = ctx.get("tid")
+    seq_no = ctx.get("seq_no")
     if not tid or seq_no is None:
-        await call.message.answer("Контекст редактирования потерян.")
-        await state.clear()
+        await notify_edit_context_lost(call, state)
         await call.answer()
         return
 
-    if field == "cancel":
-        await call.message.answer("Редактирование отменено.")
-        await state.clear()
-        await show_main_menu(call.message.bot, call.from_user.id)
-        await call.answer()
-        return
+    try:
+        if field == "cancel":
+            await call.message.answer("Редактирование отменено.")
+            await state.clear()
+            await show_main_menu(call.message.bot, call.from_user.id)
+            await call.answer()
+            return
 
-    if field == "category":
-        await state.update_data(edit_field="category", awaiting_category_text=False)
-        await call.message.answer(
-            "Выбери категорию:", reply_markup=edit_category_kb().as_markup()
+        if field == "category":
+            await state.update_data(
+                edit_field="category",
+                awaiting_category_text=False,
+                edit_ctx_warned=False,
+            )
+            await call.message.answer(
+                "Выбери категорию:", reply_markup=edit_category_kb().as_markup()
+            )
+            await call.answer()
+            return
+
+        if field == "rating":
+            await state.update_data(edit_field="rating", edit_ctx_warned=False)
+            await call.message.answer(
+                "Выбери оценку:", reply_markup=edit_rating_kb().as_markup()
+            )
+            await call.answer()
+            return
+
+        if field not in EDIT_TEXT_FIELDS:
+            await call.answer()
+            return
+
+        cfg = EDIT_TEXT_FIELDS[field]
+        await state.update_data(
+            edit_field=field,
+            awaiting_category_text=False,
+            edit_ctx_warned=False,
         )
+        await state.set_state(EditFlow.waiting_text)
+        await call.message.answer(cfg["prompt"])
         await call.answer()
-        return
-
-    if field == "rating":
-        await state.update_data(edit_field="rating")
-        await call.message.answer(
-            "Выбери оценку:", reply_markup=edit_rating_kb().as_markup()
-        )
+    except Exception:
+        logger.exception("edit flow failed")
+        await notify_edit_context_lost(call, state)
         await call.answer()
-        return
-
-    if field not in EDIT_TEXT_FIELDS:
-        await call.answer()
-        return
-
-    cfg = EDIT_TEXT_FIELDS[field]
-    await state.update_data(edit_field=field, awaiting_category_text=False)
-    await state.set_state(EditFlow.waiting_text)
-    await call.message.answer(cfg["prompt"])
-    await call.answer()
 
 
 async def edit_category_pick(call: CallbackQuery, state: FSMContext):
+    ctx = await ensure_edit_context(call, state)
+    if ctx is None:
+        await call.answer()
+        return
+
     try:
         _, raw = call.data.split(":", 1)
     except ValueError:
         await call.answer()
         return
 
-    data = await state.get_data()
-    tid = data.get("edit_t_id")
-    seq_no = data.get("edit_seq_no")
+    tid = ctx.get("tid")
+    seq_no = ctx.get("seq_no")
     if not tid or seq_no is None:
-        await call.message.answer("Контекст редактирования потерян.")
-        await state.clear()
+        await notify_edit_context_lost(call, state)
         await call.answer()
         return
 
-    if raw == "__back__":
+    try:
+        if raw == "__back__":
+            await state.set_state(EditFlow.choosing)
+            await state.update_data(
+                edit_field=None,
+                awaiting_category_text=False,
+                edit_ctx_warned=False,
+            )
+            await send_edit_menu(call, seq_no)
+            await call.answer()
+            return
+
+        if raw == "__other__":
+            await state.update_data(
+                edit_field="category",
+                awaiting_category_text=True,
+                edit_ctx_warned=False,
+            )
+            await state.set_state(EditFlow.waiting_text)
+            await call.message.answer("Пришли категорию текстом.")
+            await call.answer()
+            return
+
+        if raw not in CATEGORIES:
+            await call.answer()
+            return
+
+        if len(raw) > 60:
+            await call.message.answer("Категория слишком длинная.")
+            await call.answer()
+            return
+
+        ok = update_tasting_fields(tid, call.from_user.id, category=raw)
+        if not ok:
+            logger.warning("Failed to update category for tasting %s", tid)
+            await notify_edit_context_lost(call, state)
+            await call.answer()
+            return
+
         await state.set_state(EditFlow.choosing)
-        await state.update_data(edit_field=None, awaiting_category_text=False)
+        await state.update_data(
+            edit_field=None,
+            awaiting_category_text=False,
+            edit_ctx_warned=False,
+        )
+        await call.message.answer(f"Обновил {FIELD_LABELS['category']}.")
         await send_edit_menu(call, seq_no)
         await call.answer()
-        return
-
-    if raw == "__other__":
-        await state.update_data(edit_field="category", awaiting_category_text=True)
-        await state.set_state(EditFlow.waiting_text)
-        await call.message.answer("Пришли категорию текстом.")
+    except Exception:
+        logger.exception("edit flow failed")
+        await notify_edit_context_lost(call, state)
         await call.answer()
-        return
-
-    if raw not in CATEGORIES:
-        await call.answer()
-        return
-
-    if len(raw) > 60:
-        await call.message.answer("Категория слишком длинная.")
-        await call.answer()
-        return
-
-    ok = update_tasting_fields(tid, call.from_user.id, category=raw)
-    if not ok:
-        await call.message.answer("Не удалось обновить запись.")
-        await state.clear()
-        await call.answer()
-        return
-
-    await state.clear()
-    await state.set_state(EditFlow.choosing)
-    await state.update_data(edit_field=None, awaiting_category_text=False)
-    await call.message.answer(f"Обновил {FIELD_LABELS['category']}.")
-    await send_edit_menu(call, seq_no)
-    await call.answer()
 
 
 async def edit_rating_pick(call: CallbackQuery, state: FSMContext):
+    ctx = await ensure_edit_context(call, state)
+    if ctx is None:
+        await call.answer()
+        return
+
     try:
         _, raw = call.data.split(":", 1)
         rating = int(raw)
@@ -2893,81 +3023,106 @@ async def edit_rating_pick(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    data = await state.get_data()
-    tid = data.get("edit_t_id")
-    seq_no = data.get("edit_seq_no")
+    tid = ctx.get("tid")
+    seq_no = ctx.get("seq_no")
     if not tid or seq_no is None:
-        await call.message.answer("Контекст редактирования потерян.")
-        await state.clear()
+        await notify_edit_context_lost(call, state)
         await call.answer()
         return
 
-    ok = update_tasting_fields(tid, call.from_user.id, rating=rating)
-    if not ok:
-        await call.message.answer("Не удалось обновить запись.")
-        await state.clear()
-        await call.answer()
-        return
+    try:
+        ok = update_tasting_fields(tid, call.from_user.id, rating=rating)
+        if not ok:
+            logger.warning("Failed to update rating for tasting %s", tid)
+            await notify_edit_context_lost(call, state)
+            await call.answer()
+            return
 
-    await state.set_state(EditFlow.choosing)
-    await state.update_data(edit_field=None, awaiting_category_text=False)
-    await call.message.answer(f"Обновил {FIELD_LABELS['rating']}.")
-    await send_edit_menu(call, seq_no)
-    await call.answer()
+        await state.set_state(EditFlow.choosing)
+        await state.update_data(
+            edit_field=None,
+            awaiting_category_text=False,
+            edit_ctx_warned=False,
+        )
+        await call.message.answer(f"Обновил {FIELD_LABELS['rating']}.")
+        await send_edit_menu(call, seq_no)
+        await call.answer()
+    except Exception:
+        logger.exception("edit flow failed")
+        await notify_edit_context_lost(call, state)
+        await call.answer()
 
 
 async def edit_flow_msg(message: Message, state: FSMContext):
+    ctx = await ensure_edit_context(message, state)
+    if ctx is None:
+        return
+
     data = await state.get_data()
-    tid = data.get("edit_t_id")
-    seq_no = data.get("edit_seq_no")
+    tid = ctx.get("tid")
+    seq_no = ctx.get("seq_no")
     field = data.get("edit_field")
     awaiting_category = data.get("awaiting_category_text")
 
     if not tid or seq_no is None or not field:
-        await message.answer("Контекст редактирования потерян.")
-        await state.clear()
+        await notify_edit_context_lost(message, state)
         return
 
-    if field == "category" and awaiting_category:
-        txt = (message.text or "").strip()
-        if not txt or txt == "-":
-            await message.answer("Категория не может быть пустой. Пришли категорию текстом.")
+    try:
+        if field == "category" and awaiting_category:
+            txt = (message.text or "").strip()
+            if not txt or txt == "-":
+                await message.answer(
+                    "Категория не может быть пустой. Пришли категорию текстом."
+                )
+                return
+            if len(txt) > 60:
+                await message.answer(
+                    "Категория слишком длинная. Пришли категорию текстом покороче."
+                )
+                return
+            ok = update_tasting_fields(tid, message.from_user.id, category=txt)
+            if not ok:
+                logger.warning("Failed to update category text for tasting %s", tid)
+                await notify_edit_context_lost(message, state)
+                return
+            await state.set_state(EditFlow.choosing)
+            await state.update_data(
+                edit_field=None,
+                awaiting_category_text=False,
+                edit_ctx_warned=False,
+            )
+            await message.answer(f"Обновил {FIELD_LABELS['category']}.")
+            await send_edit_menu(message, seq_no)
             return
-        if len(txt) > 60:
-            await message.answer("Категория слишком длинная. Пришли категорию текстом покороче.")
+
+        if field not in EDIT_TEXT_FIELDS:
+            await notify_edit_context_lost(message, state)
             return
-        ok = update_tasting_fields(tid, message.from_user.id, category=txt)
+
+        value, error, column = prepare_text_edit(field, message.text or "")
+        if error:
+            await message.answer(error)
+            return
+
+        updates = {column: value}
+        ok = update_tasting_fields(tid, message.from_user.id, **updates)
         if not ok:
-            await message.answer("Не удалось обновить запись.")
-            await state.clear()
+            logger.warning("Failed to update field %s for tasting %s", field, tid)
+            await notify_edit_context_lost(message, state)
             return
+
         await state.set_state(EditFlow.choosing)
-        await state.update_data(edit_field=None, awaiting_category_text=False)
-        await message.answer(f"Обновил {FIELD_LABELS['category']}.")
+        await state.update_data(
+            edit_field=None,
+            awaiting_category_text=False,
+            edit_ctx_warned=False,
+        )
+        await message.answer(f"Обновил {FIELD_LABELS[field]}.")
         await send_edit_menu(message, seq_no)
-        return
-
-    if field not in EDIT_TEXT_FIELDS:
-        await message.answer("Не знаю, что редактировать.")
-        await state.clear()
-        return
-
-    value, error, column = prepare_text_edit(field, message.text or "")
-    if error:
-        await message.answer(error)
-        return
-
-    updates = {column: value}
-    ok = update_tasting_fields(tid, message.from_user.id, **updates)
-    if not ok:
-        await message.answer("Не удалось обновить запись.")
-        await state.clear()
-        return
-
-    await state.set_state(EditFlow.choosing)
-    await state.update_data(edit_field=None, awaiting_category_text=False)
-    await message.answer(f"Обновил {FIELD_LABELS[field]}.")
-    await send_edit_menu(message, seq_no)
+    except Exception:
+        logger.exception("edit flow failed")
+        await notify_edit_context_lost(message, state)
 
 
 async def edit_cmd(message: Message, state: FSMContext):
@@ -2986,6 +3141,7 @@ async def edit_cmd(message: Message, state: FSMContext):
         edit_seq_no=target.seq_no,
         edit_field=None,
         awaiting_category_text=False,
+        edit_ctx_warned=False,
     )
     await send_edit_menu(message, target.seq_no)
 
@@ -3096,6 +3252,13 @@ async def back_main(call: CallbackQuery):
     await call.answer()
 
 
+async def nav_home(call: CallbackQuery, state: FSMContext):
+    await state.update_data(edit_t_id=None, edit_field=None, edit_ctx_warned=False)
+    await state.clear()
+    await show_main_menu(call.message.bot, call.from_user.id)
+    await call.answer()
+
+
 async def tz_cmd(message: Message):
     """
     /tz -> показать текущий сдвиг
@@ -3197,6 +3360,7 @@ def setup_handlers(dp: Dispatcher):
     dp.callback_query.register(find_cb, F.data == "find")
     dp.callback_query.register(help_cb, F.data == "help")
     dp.callback_query.register(back_main, F.data == "back:main")
+    dp.callback_query.register(nav_home, F.data == "nav:home")
 
     dp.callback_query.register(cat_pick, F.data.startswith("cat:"))
     dp.callback_query.register(s_cat_pick, F.data.startswith("scat:"))
