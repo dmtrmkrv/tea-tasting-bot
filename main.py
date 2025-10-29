@@ -4,14 +4,13 @@ import os
 import datetime
 import uuid
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Any
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, BotCommand,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, FSInputFile,
     InputMediaPhoto,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -27,7 +26,6 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     select,
-    func,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -244,6 +242,9 @@ def get_user_now_hm(uid: int) -> str:
 # ---------------- КОНСТАНТЫ UI ----------------
 
 CATEGORIES = ["Зелёный", "Белый", "Красный", "Улун", "Шу Пуэр", "Шен Пуэр", "Хэй Ча", "Другое"]
+DEFAULT_CATEGORIES = [c for c in CATEGORIES if c != "Другое"]
+DEFAULT_CATEGORIES_CF = {c.casefold() for c in DEFAULT_CATEGORIES}
+CUSTOM_CATEGORY_ALIASES = {"другое", "другая", "другая категория", "other"}
 BODY_PRESETS = ["тонкое", "лёгкое", "среднее", "плотное", "маслянистое"]
 
 EFFECTS = [
@@ -312,28 +313,11 @@ def main_kb() -> InlineKeyboardBuilder:
     return kb
 
 
-def reply_main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="📝 Новая дегустация"),
-                KeyboardButton(text="🔎 Найти записи"),
-            ],
-            [
-                KeyboardButton(text="🕔 Последние 5"),
-                KeyboardButton(text="❔ Помощь"),
-            ],
-            [KeyboardButton(text="Сброс")],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Выбери действие",
-    )
-
-
 def category_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     for c in CATEGORIES:
-        kb.button(text=c, callback_data=f"cat:{c}")
+        callback = "cat:__other__" if c == "Другое" else f"cat:{c}"
+        kb.button(text=c, callback_data=callback)
     kb.adjust(2)
     return kb
 
@@ -341,8 +325,8 @@ def category_kb() -> InlineKeyboardBuilder:
 def category_search_kb() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     for c in CATEGORIES:
-        kb.button(text=c, callback_data=f"scat:{c}")
-    kb.button(text="Другая категория (ввести)", callback_data="scat:__other__")
+        callback = "scat:__other__" if c == "Другое" else f"scat:{c}"
+        kb.button(text=c, callback_data=callback)
     kb.adjust(2)
     return kb
 
@@ -425,6 +409,13 @@ def search_menu_kb() -> InlineKeyboardBuilder:
     return kb
 
 
+def back_only_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад", callback_data="back:main")
+    kb.adjust(1)
+    return kb
+
+
 def open_btn_kb(t_id: int) -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="Открыть", callback_data=f"open:{t_id}")
@@ -453,6 +444,46 @@ def confirm_del_kb(t_id: int) -> InlineKeyboardBuilder:
     kb.button(text="Да, удалить", callback_data=f"delok:{t_id}")
     kb.button(text="Отмена", callback_data=f"delno:{t_id}")
     kb.adjust(2)
+    return kb
+
+
+def edit_menu_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Название", callback_data="efld:name")
+    kb.button(text="Год", callback_data="efld:year")
+    kb.button(text="Регион", callback_data="efld:region")
+    kb.button(text="Категория", callback_data="efld:category")
+    kb.button(text="Граммовка", callback_data="efld:grams")
+    kb.button(text="Температура", callback_data="efld:temp_c")
+    kb.button(text="Время", callback_data="efld:tasted_at")
+    kb.button(text="Посуда", callback_data="efld:gear")
+    kb.button(text="Аромат (сухой)", callback_data="efld:aroma_dry")
+    kb.button(text="Аромат (прогретый)", callback_data="efld:aroma_warmed")
+    kb.button(text="Ощущения", callback_data="efld:effects")
+    kb.button(text="Сценарии", callback_data="efld:scenarios")
+    kb.button(text="Оценка", callback_data="efld:rating")
+    kb.button(text="Заметка", callback_data="efld:summary")
+    kb.button(text="Отмена", callback_data="efld:cancel")
+    kb.adjust(2)
+    return kb
+
+
+def edit_category_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for c in CATEGORIES:
+        kb.button(text=c, callback_data=f"ecat:{c}")
+    kb.button(text="Другое (ввести)", callback_data="ecat:__other__")
+    kb.button(text="⬅️ Назад", callback_data="efld:menu")
+    kb.adjust(2)
+    return kb
+
+
+def edit_rating_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    for i in range(0, 11):
+        kb.button(text=str(i), callback_data=f"erate:{i}")
+    kb.button(text="⬅️ Назад", callback_data="efld:menu")
+    kb.adjust(6, 5, 1)
     return kb
 
 
@@ -509,6 +540,7 @@ class SearchFlow(StatesGroup):
 
 
 class EditFlow(StatesGroup):
+    choosing = State()
     waiting_text = State()
 
 
@@ -532,7 +564,7 @@ async def ui(target: Union[CallbackQuery, Message], text: str, reply_markup=None
 
 
 def short_row(t: Tasting) -> str:
-    return f"#{t.id} [{t.category}] {t.name}"
+    return t.title
 
 
 def build_card_text(
@@ -540,7 +572,7 @@ def build_card_text(
     infusions: List[dict],
     photo_count: Optional[int] = None,
 ) -> str:
-    lines = [f"{t.title}"]
+    lines = [t.title]
     lines.append(f"⭐ Оценка: {t.rating}")
     if t.grams is not None:
         lines.append(f"⚖️ Граммовка: {t.grams} г")
@@ -861,7 +893,7 @@ async def region_in(message: Message, state: FSMContext):
 
 async def cat_pick(call: CallbackQuery, state: FSMContext):
     _, val = call.data.split(":", 1)
-    if val == "Другое":
+    if val == "__other__":
         await ui(call, "Введи категорию текстом:")
         await state.update_data(awaiting_custom_cat=True)
         await call.answer()
@@ -1533,6 +1565,40 @@ def has_more_last(min_id: int, uid: Optional[int] = None) -> bool:
         return nxt is not None
 
 
+def fetch_user_tastings(uid: int) -> List[Tasting]:
+    with SessionLocal() as s:
+        return (
+            s.execute(
+                select(Tasting)
+                .where(Tasting.user_id == uid)
+                .order_by(Tasting.id.desc())
+            )
+            .scalars()
+            .all()
+        )
+
+
+def match_name(t: Tasting, q_cf: str) -> bool:
+    return (t.name or "").casefold().find(q_cf) >= 0
+
+
+def is_custom_category(cat: Optional[str]) -> bool:
+    if not cat:
+        return False
+    return cat.casefold() not in DEFAULT_CATEGORIES_CF
+
+
+def filter_by_category(tastings: List[Tasting], key: str) -> List[Tasting]:
+    if key == "__other__":
+        return [t for t in tastings if is_custom_category(t.category)]
+    q_cf = key.casefold()
+    return [
+        t
+        for t in tastings
+        if (t.category or "").casefold() == q_cf
+    ]
+
+
 async def find_cb(call: CallbackQuery):
     await ui(
         call,
@@ -1704,29 +1770,23 @@ async def s_name(call: CallbackQuery, state: FSMContext):
 
 
 async def s_name_run(message: Message, state: FSMContext):
-    q = message.text.strip()
+    q = (message.text or "").strip()
+    if not q:
+        await message.answer(
+            "Нужно указать часть названия.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await state.clear()
+        return
     uid = message.from_user.id
 
-    token = new_ctx({"type": "name", "q": q, "uid": uid})
-
-    with SessionLocal() as s:
-        rows = (
-            s.execute(
-                select(Tasting)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.name).like(f"%{q.lower()}%"),
-                )
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            )
-            .scalars()
-            .all()
-        )
+    q_cf = q.casefold()
+    tastings = fetch_user_tastings(uid)
+    matches = [t for t in tastings if match_name(t, q_cf)]
 
     await state.clear()
 
-    if not rows:
+    if not matches:
         await message.answer(
             "Ничего не нашёл.",
             reply_markup=search_menu_kb().as_markup(),
@@ -1734,36 +1794,25 @@ async def s_name_run(message: Message, state: FSMContext):
         return
 
     await message.answer("Найдено:")
-    for t in rows:
+    first_page = matches[:PAGE_SIZE]
+    for t in first_page:
         await message.answer(
             short_row(t),
             reply_markup=open_btn_kb(t.id).as_markup(),
         )
 
-    min_id = rows[-1].id
-
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                select(Tasting.id)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.name).like(f"%{q.lower()}%"),
-                    Tasting.id < min_id,
-                )
-                .order_by(Tasting.id.desc())
-                .limit(1)
-            )
-            .scalars()
-            .first()
-            is not None
-        )
-
-    if more:
+    if len(matches) > PAGE_SIZE:
+        ctx = {
+            "type": "name",
+            "uid": uid,
+            "q": q_cf,
+            "ids": [t.id for t in matches],
+        }
+        token = new_ctx(ctx)
         await message.answer(
             "Показать ещё:",
             reply_markup=more_btn_kb(
-                "name", f"{token}:{min_id}"
+                "name", f"{token}:{PAGE_SIZE}"
             ).as_markup(),
         )
 
@@ -1776,7 +1825,7 @@ async def more_name(call: CallbackQuery):
     _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
-        cursor = int(sid)
+        offset = int(sid)
     except Exception:
         await call.answer()
         return
@@ -1794,31 +1843,12 @@ async def more_name(call: CallbackQuery):
         await call.answer()
         return
 
-    q = ctx["q"]
-    uid = ctx["uid"]
-
-    with SessionLocal() as s:
-        rows = (
-            s.execute(
-                select(Tasting)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.name).like(f"%{q.lower()}%"),
-                    Tasting.id < cursor,
-                )
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            )
-            .scalars()
-            .all()
-        )
-
-    try:
-        await call.message.edit_reply_markup()
-    except TelegramBadRequest:
-        pass
-
-    if not rows:
+    ids: List[int] = ctx.get("ids", [])
+    if offset >= len(ids):
+        try:
+            await call.message.edit_reply_markup()
+        except TelegramBadRequest:
+            pass
         await call.message.answer(
             "Больше результатов нет.",
             reply_markup=search_menu_kb().as_markup(),
@@ -1826,35 +1856,60 @@ async def more_name(call: CallbackQuery):
         await call.answer()
         return
 
-    for t in rows:
+    next_ids = ids[offset : offset + PAGE_SIZE]
+    if not next_ids:
+        try:
+            await call.message.edit_reply_markup()
+        except TelegramBadRequest:
+            pass
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await call.answer()
+        return
+
+    with SessionLocal() as s:
+        rows = (
+            s.execute(
+                select(Tasting)
+                .where(
+                    Tasting.user_id == call.from_user.id,
+                    Tasting.id.in_(next_ids),
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    rows_by_id = {t.id: t for t in rows}
+    ordered_rows = [rows_by_id[i] for i in next_ids if i in rows_by_id]
+
+    try:
+        await call.message.edit_reply_markup()
+    except TelegramBadRequest:
+        pass
+
+    if not ordered_rows:
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await call.answer()
+        return
+
+    for t in ordered_rows:
         await call.message.answer(
             short_row(t),
             reply_markup=open_btn_kb(t.id).as_markup(),
         )
 
-    min_id = rows[-1].id
-
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                select(Tasting.id)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.name).like(f"%{q.lower()}%"),
-                    Tasting.id < min_id,
-                )
-                .order_by(Tasting.id.desc())
-                .limit(1)
-            )
-            .scalars()
-            .first()
-            is not None
-        )
-    if more:
+    next_offset = offset + len(ordered_rows)
+    if next_offset < len(ids):
         await call.message.answer(
             "Показать ещё:",
             reply_markup=more_btn_kb(
-                "name", f"{token}:{min_id}"
+                "name", f"{token}:{next_offset}"
             ).as_markup(),
         )
 
@@ -1866,39 +1921,24 @@ async def more_name(call: CallbackQuery):
 async def s_cat(call: CallbackQuery, state: FSMContext):
     await ui(
         call,
-        "Выбери категорию или укажи вручную:",
+        "Выбери категорию или введи её вручную сообщением:",
         reply_markup=category_search_kb().as_markup(),
     )
-    await state.clear()
+    await state.set_state(SearchFlow.category)
     await call.answer()
 
 
-async def s_cat_pick(call: CallbackQuery):
+async def s_cat_pick(call: CallbackQuery, state: FSMContext):
     _, val = call.data.split(":", 1)
     uid = call.from_user.id
 
-    if val == "__other__":
-        await ui(call, "Введи категорию текстом:")
-        return
+    await state.clear()
 
-    token = new_ctx({"type": "cat", "cat": val, "uid": uid})
+    key = "__other__" if val == "__other__" else val
+    tastings = fetch_user_tastings(uid)
+    matches = filter_by_category(tastings, key)
 
-    with SessionLocal() as s:
-        rows = (
-            s.execute(
-                select(Tasting)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.category) == val.lower(),
-                )
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            )
-            .scalars()
-            .all()
-        )
-
-    if not rows:
+    if not matches:
         await call.message.answer(
             "Ничего не нашёл.",
             reply_markup=search_menu_kb().as_markup(),
@@ -1906,29 +1946,29 @@ async def s_cat_pick(call: CallbackQuery):
         await call.answer()
         return
 
-    await call.message.answer(f"Найдено по категории «{val}»:")
-    for t in rows:
-        await call.message.answer(short_row(t), reply_markup=open_btn_kb(t.id).as_markup())
+    if key == "__other__":
+        heading = "Найдено по пользовательским категориям:"
+    else:
+        heading = f"Найдено по категории «{val}»:"
 
-    min_id = rows[-1].id
-
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                select(Tasting.id)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.category) == val.lower(),
-                    Tasting.id < min_id,
-                )
-                .order_by(Tasting.id.desc()).limit(1)
-            ).scalars().first()
-            is not None
+    await call.message.answer(heading)
+    first_page = matches[:PAGE_SIZE]
+    for t in first_page:
+        await call.message.answer(
+            short_row(t), reply_markup=open_btn_kb(t.id).as_markup()
         )
-    if more:
+
+    if len(matches) > PAGE_SIZE:
+        ctx = {
+            "type": "cat",
+            "uid": uid,
+            "key": key,
+            "ids": [t.id for t in matches],
+        }
+        token = new_ctx(ctx)
         await call.message.answer(
             "Показать ещё:",
-            reply_markup=more_btn_kb("cat", f"{token}:{min_id}").as_markup(),
+            reply_markup=more_btn_kb("cat", f"{token}:{PAGE_SIZE}").as_markup(),
         )
     await call.answer()
 
@@ -1937,56 +1977,47 @@ async def s_cat_text(message: Message, state: FSMContext):
     q = (message.text or "").strip()
     uid = message.from_user.id
 
-    token = new_ctx({"type": "cat", "cat": q, "uid": uid})
+    if not q:
+        await message.answer("Нужно указать категорию.", reply_markup=search_menu_kb().as_markup())
+        await state.clear()
+        return
 
-    with SessionLocal() as s:
-        rows = (
-            s.execute(
-                select(Tasting)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.category) == q.lower(),
-                )
-                .order_by(Tasting.id.desc())
-                .limit(PAGE_SIZE)
-            ).scalars().all()
-        )
+    key = "__other__" if q.casefold() in CUSTOM_CATEGORY_ALIASES else q
+    tastings = fetch_user_tastings(uid)
+    matches = filter_by_category(tastings, key)
 
-    if not rows:
+    await state.clear()
+
+    if not matches:
         await message.answer("Ничего не нашёл.", reply_markup=search_menu_kb().as_markup())
         return
 
-    await message.answer(f"Найдено по категории «{q}»:")
-    for t in rows:
+    if key == "__other__":
+        heading = "Найдено по пользовательским категориям:"
+    else:
+        heading = f"Найдено по категории «{q}»:"
+
+    await message.answer(heading)
+    first_page = matches[:PAGE_SIZE]
+    for t in first_page:
         await message.answer(short_row(t), reply_markup=open_btn_kb(t.id).as_markup())
 
-    min_id = rows[-1].id
-
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                select(Tasting.id)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.category) == q.lower(),
-                    Tasting.id < min_id,
-                )
-                .order_by(Tasting.id.desc()).limit(1)
-            ).scalars().first()
-            is not None
-        )
-    if more:
-        await message.answer(
-            "Показать ещё:",
-            reply_markup=more_btn_kb("cat", f"{token}:{min_id}").as_markup(),
-        )
+    if len(matches) > PAGE_SIZE:
+        ctx = {
+            "type": "cat",
+            "uid": uid,
+            "key": key,
+            "ids": [t.id for t in matches],
+        }
+        token = new_ctx(ctx)
+        await message.answer("Показать ещё:", reply_markup=more_btn_kb("cat", f"{token}:{PAGE_SIZE}").as_markup())
 
 
 async def more_cat(call: CallbackQuery):
     _, _, payload = call.data.split(":", 2)
     try:
         token, sid = payload.split(":", 1)
-        cursor = int(sid)
+        offset = int(sid)
     except Exception:
         await call.answer()
         return
@@ -2004,58 +2035,72 @@ async def more_cat(call: CallbackQuery):
         await call.answer()
         return
 
-    cat = ctx["cat"]
-    uid = ctx["uid"]
+    ids: List[int] = ctx.get("ids", [])
+    if offset >= len(ids):
+        try:
+            await call.message.edit_reply_markup()
+        except TelegramBadRequest:
+            pass
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await call.answer()
+        return
+
+    next_ids = ids[offset : offset + PAGE_SIZE]
+    if not next_ids:
+        try:
+            await call.message.edit_reply_markup()
+        except TelegramBadRequest:
+            pass
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
+        await call.answer()
+        return
 
     with SessionLocal() as s:
         rows = (
             s.execute(
                 select(Tasting)
                 .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.category) == cat.lower(),
-                    Tasting.id < cursor,
+                    Tasting.user_id == call.from_user.id,
+                    Tasting.id.in_(next_ids),
                 )
-                .order_by(Tasting.id.desc()).limit(PAGE_SIZE)
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         )
+
+    rows_by_id = {t.id: t for t in rows}
+    ordered_rows = [rows_by_id[i] for i in next_ids if i in rows_by_id]
 
     try:
         await call.message.edit_reply_markup()
     except TelegramBadRequest:
         pass
 
-    if not rows:
-        await call.message.answer("Больше результатов нет.", reply_markup=search_menu_kb().as_markup())
+    if not ordered_rows:
+        await call.message.answer(
+            "Больше результатов нет.",
+            reply_markup=search_menu_kb().as_markup(),
+        )
         await call.answer()
         return
 
-    for t in rows:
+    for t in ordered_rows:
         await call.message.answer(short_row(t), reply_markup=open_btn_kb(t.id).as_markup())
 
-    min_id = rows[-1].id
-    with SessionLocal() as s:
-        more = (
-            s.execute(
-                select(Tasting.id)
-                .where(
-                    Tasting.user_id == uid,
-                    func.lower(Tasting.category) == cat.lower(),
-                    Tasting.id < min_id,
-                )
-                .order_by(Tasting.id.desc()).limit(1)
-            ).scalars().first()
-            is not None
-        )
-    if more:
+    next_offset = offset + len(ordered_rows)
+    if next_offset < len(ids):
         await call.message.answer(
             "Показать ещё:",
-            reply_markup=more_btn_kb("cat", f"{token}:{min_id}").as_markup(),
+            reply_markup=more_btn_kb("cat", f"{token}:{next_offset}").as_markup(),
         )
     await call.answer()
 
-
-# --- поиск по году
 
 async def s_year(call: CallbackQuery, state: FSMContext):
     await ui(
@@ -2334,21 +2379,121 @@ async def open_card(call: CallbackQuery):
             for inf in inf_list
         ]
 
-        photo_count = (
+        photo_files = (
             s.execute(
-                select(func.count(Photo.id)).where(Photo.tasting_id == tid)
+                select(Photo.file_id)
+                .where(Photo.tasting_id == tid)
+                .order_by(Photo.id)
             )
-            .scalar_one()
+            .scalars()
+            .all()
         )
 
     card_text = build_card_text(
-        t, infusions_data, photo_count=photo_count or 0
+        t, infusions_data, photo_count=len(photo_files)
     )
-    await call.message.answer(
-        card_text,
-        reply_markup=card_actions_kb(t.id).as_markup(),
-    )
+    actions_markup = card_actions_kb(t.id).as_markup()
+    chat_id = call.message.chat.id
+    bot = call.message.bot
+
+    if photo_files:
+        if len(card_text) <= 1024:
+            if len(photo_files) == 1:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo_files[0],
+                    caption=card_text,
+                    reply_markup=actions_markup,
+                )
+            else:
+                media = [
+                    InputMediaPhoto(media=photo_files[0], caption=card_text)
+                ]
+                media += [
+                    InputMediaPhoto(media=fid)
+                    for fid in photo_files[1:10]
+                ]
+                await bot.send_media_group(chat_id, media)
+                await call.message.answer(
+                    "Действия:", reply_markup=actions_markup
+                )
+        else:
+            await call.message.answer(
+                card_text, reply_markup=actions_markup
+            )
+            if len(photo_files) == 1:
+                await bot.send_photo(chat_id, photo_files[0])
+            else:
+                media = [
+                    InputMediaPhoto(media=fid) for fid in photo_files[:10]
+                ]
+                await bot.send_media_group(chat_id, media)
+    else:
+        await call.message.answer(
+            card_text,
+            reply_markup=actions_markup,
+        )
     await call.answer()
+
+
+async def prompt_edit_menu(target: Union[Message, CallbackQuery], state: FSMContext):
+    text = (
+        "Что изменить? Выбери поле. Чтобы очистить значение, пришли «-»"
+        " или воспользуйся кнопкой «Отмена»."
+    )
+    markup = edit_menu_kb().as_markup()
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text, reply_markup=markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+    await state.set_state(EditFlow.choosing)
+
+
+def update_tasting_fields(tid: int, uid: int, **updates: Any) -> bool:
+    if not updates:
+        return False
+    with SessionLocal() as s:
+        t = s.get(Tasting, tid)
+        if not t or t.user_id != uid:
+            return False
+        for key, value in updates.items():
+            setattr(t, key, value)
+        s.commit()
+    return True
+
+
+EDIT_FIELD_PROMPTS: Dict[str, str] = {
+    "name": "Пришли новое название.",
+    "year": "Пришли год (4 цифры) или «-» чтобы очистить.",
+    "region": "Пришли регион или «-» чтобы очистить.",
+    "grams": "Пришли граммовку (число, можно с точкой) или «-».",
+    "temp_c": "Пришли температуру (°C) или «-».",
+    "tasted_at": "Пришли время дегустации в формате HH:MM или «-».",
+    "gear": "Пришли посуду дегустации или «-».",
+    "aroma_dry": "Пришли аромат сухого листа или «-».",
+    "aroma_warmed": "Пришли аромат прогретого/промытого листа или «-».",
+    "effects": "Пришли ощущения (перечисли через запятую) или «-».",
+    "scenarios": "Пришли сценарии (через запятую) или «-».",
+    "summary": "Пришли заметку или «-» чтобы очистить.",
+}
+
+
+EDIT_SUCCESS_LABELS: Dict[str, str] = {
+    "name": "название",
+    "year": "год",
+    "region": "регион",
+    "category": "категорию",
+    "grams": "граммовку",
+    "temp_c": "температуру",
+    "tasted_at": "время дегустации",
+    "gear": "посуду",
+    "aroma_dry": "аромат сухого листа",
+    "aroma_warmed": "аромат прогретого листа",
+    "effects": "ощущения",
+    "scenarios": "сценарии",
+    "rating": "оценку",
+    "summary": "заметку",
+}
 
 
 async def edit_cb(call: CallbackQuery, state: FSMContext):
@@ -2366,11 +2511,124 @@ async def edit_cb(call: CallbackQuery, state: FSMContext):
             await call.answer()
             return
 
-    await state.update_data(edit_t_id=tid)
-    await state.set_state(EditFlow.waiting_text)
-    await call.message.answer(
-        "Пришли новый текст заметки. Старое значение перезапишется."
+    await state.update_data(
+        edit_t_id=tid,
+        edit_field=None,
+        awaiting_custom_category=False,
     )
+    await prompt_edit_menu(call, state)
+    await call.answer()
+
+
+async def edit_field_select(call: CallbackQuery, state: FSMContext):
+    _, field = call.data.split(":", 1)
+    data = await state.get_data()
+    tid = data.get("edit_t_id")
+    if not tid:
+        await call.message.answer("Не знаю, что редактировать. Начни заново.")
+        await state.clear()
+        await call.answer()
+        return
+
+    if field == "cancel":
+        await state.clear()
+        await call.message.answer("Редактирование отменено.")
+        await call.answer()
+        return
+
+    if field == "menu":
+        await prompt_edit_menu(call, state)
+        await call.answer()
+        return
+
+    if field == "rating":
+        await state.update_data(edit_field="rating", awaiting_custom_category=False)
+        await call.message.answer(
+            "Выбери новую оценку:", reply_markup=edit_rating_kb().as_markup()
+        )
+        await call.answer()
+        return
+
+    if field == "category":
+        await state.update_data(
+            edit_field="category",
+            awaiting_custom_category=False,
+        )
+        await state.set_state(EditFlow.waiting_text)
+        await call.message.answer(
+            "Выбери новую категорию или введи её текстом:",
+            reply_markup=edit_category_kb().as_markup(),
+        )
+        await call.answer()
+        return
+
+    prompt = EDIT_FIELD_PROMPTS.get(field)
+    if not prompt:
+        await call.message.answer("Этот параметр пока нельзя изменить.")
+        await call.answer()
+        return
+
+    await state.update_data(edit_field=field, awaiting_custom_category=False)
+    await state.set_state(EditFlow.waiting_text)
+    await call.message.answer(prompt)
+    await call.answer()
+
+
+async def edit_category_pick(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tid = data.get("edit_t_id")
+    if not tid:
+        await call.message.answer("Не знаю, что редактировать. Начни заново.")
+        await state.clear()
+        await call.answer()
+        return
+
+    _, val = call.data.split(":", 1)
+    if val == "__other__":
+        await state.update_data(
+            edit_field="category",
+            awaiting_custom_category=True,
+        )
+        await state.set_state(EditFlow.waiting_text)
+        await call.message.answer("Введи новую категорию текстом:")
+        await call.answer()
+        return
+
+    success = update_tasting_fields(tid, call.from_user.id, category=val)
+    if success:
+        await state.update_data(edit_field=None, awaiting_custom_category=False)
+        await call.message.answer(f"Обновил категорию на «{val}».")
+        await prompt_edit_menu(call, state)
+    else:
+        await call.message.answer("Не удалось обновить категорию.")
+        await state.clear()
+    await call.answer()
+
+
+async def edit_rating_pick(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tid = data.get("edit_t_id")
+    if not tid:
+        await call.message.answer("Не знаю, что редактировать. Начни заново.")
+        await state.clear()
+        await call.answer()
+        return
+
+    try:
+        _, val = call.data.split(":", 1)
+        rating = int(val)
+    except Exception:
+        await call.answer()
+        return
+
+    success = update_tasting_fields(tid, call.from_user.id, rating=rating)
+    if success:
+        await state.update_data(edit_field=None, awaiting_custom_category=False)
+        await call.message.answer(f"Обновил оценку: {rating}.")
+        await prompt_edit_menu(call, state)
+    else:
+        await call.message.answer("Не удалось обновить оценку.")
+        await state.clear()
     await call.answer()
 
 
@@ -2421,20 +2679,98 @@ async def del_no_cb(call: CallbackQuery):
 async def edit_flow_msg(message: Message, state: FSMContext):
     data = await state.get_data()
     tid = data.get("edit_t_id")
-    if not tid:
+    field = data.get("edit_field")
+    if not tid or not field:
         await message.answer("Не знаю, что редактировать.")
         await state.clear()
         return
-    with SessionLocal() as s:
-        t = s.get(Tasting, tid)
-        if not t or t.user_id != message.from_user.id:
-            await message.answer("Нет доступа к этой записи.")
-            await state.clear()
+
+    raw = (message.text or "").strip()
+    cleared = raw == "-" or raw == ""
+    updates: Dict[str, Any] = {}
+
+    if field == "name":
+        if cleared:
+            await message.answer("Название не может быть пустым.")
             return
-        t.summary = (message.text or "").strip()
-        s.commit()
-    await message.answer("Обновил заметку.")
-    await state.clear()
+        updates["name"] = raw
+    elif field == "year":
+        if cleared:
+            updates["year"] = None
+        elif raw.isdigit():
+            updates["year"] = int(raw)
+        else:
+            await message.answer("Нужен год цифрами или «-» для очистки.")
+            return
+    elif field == "region":
+        updates["region"] = None if cleared else raw
+    elif field == "grams":
+        if cleared:
+            updates["grams"] = None
+        else:
+            try:
+                updates["grams"] = float(raw.replace(",", "."))
+            except Exception:
+                await message.answer("Нужно число или «-» для очистки.")
+                return
+    elif field == "temp_c":
+        if cleared:
+            updates["temp_c"] = None
+        else:
+            try:
+                updates["temp_c"] = int(float(raw.replace(",", ".")))
+            except Exception:
+                await message.answer("Нужно число или «-» для очистки.")
+                return
+    elif field == "tasted_at":
+        if cleared:
+            updates["tasted_at"] = None
+        else:
+            try:
+                datetime.datetime.strptime(raw, "%H:%M")
+            except Exception:
+                await message.answer("Формат HH:MM или «-».")
+                return
+            updates["tasted_at"] = raw
+    elif field == "gear":
+        updates["gear"] = None if cleared else raw
+    elif field == "aroma_dry":
+        updates["aroma_dry"] = None if cleared else raw
+    elif field == "aroma_warmed":
+        updates["aroma_warmed"] = None if cleared else raw
+    elif field == "effects":
+        if cleared:
+            updates["effects_csv"] = None
+        else:
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            updates["effects_csv"] = ", ".join(parts) if parts else None
+    elif field == "scenarios":
+        if cleared:
+            updates["scenarios_csv"] = None
+        else:
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            updates["scenarios_csv"] = ", ".join(parts) if parts else None
+    elif field == "summary":
+        updates["summary"] = None if cleared else raw
+    elif field == "category":
+        if cleared:
+            await message.answer("Категория не может быть пустой.")
+            return
+        updates["category"] = raw
+    else:
+        await message.answer("Этот параметр пока нельзя изменить.")
+        return
+
+    success = update_tasting_fields(tid, message.from_user.id, **updates)
+    if not success:
+        await message.answer("Не удалось сохранить изменения.")
+        await state.clear()
+        return
+
+    label = EDIT_SUCCESS_LABELS.get(field, "параметр")
+    await message.answer(f"Обновил {label}.")
+    await state.update_data(edit_field=None, awaiting_custom_category=False)
+    await prompt_edit_menu(message, state)
 
 
 async def edit_cmd(message: Message, state: FSMContext):
@@ -2448,11 +2784,13 @@ async def edit_cmd(message: Message, state: FSMContext):
         if not t or t.user_id != message.from_user.id:
             await message.answer("Нет доступа к этой записи.")
             return
-    await state.update_data(edit_t_id=tid)
-    await state.set_state(EditFlow.waiting_text)
-    await message.answer(
-        f"Редактирование #{tid}. Пришли новый текст заметки."
+    await state.update_data(
+        edit_t_id=tid,
+        edit_field=None,
+        awaiting_custom_category=False,
     )
+    await message.answer(f"Редактирование ID {tid}.")
+    await prompt_edit_menu(message, state)
 
 
 async def delete_cmd(message: Message):
@@ -2474,86 +2812,55 @@ async def delete_cmd(message: Message):
 
 # ---------------- КОМАНДЫ /start /help /tz и т.п. ----------------
 
-async def show_main_menu(bot: Bot, chat_id: int):
-    caption = "Привет! Что делаем — создать новую запись или найти уже созданную?"
-    await bot.send_message(
-        chat_id=chat_id,
-        text=caption,
-        reply_markup=main_kb().as_markup(),
-    )
+MAIN_MENU_TEXT = "Привет! Что делаем — создать новую запись или найти уже созданную?"
+BOT_COMMANDS: List[tuple[str, str]] = [
+    ("start", "Меню"),
+    ("new", "Новая дегустация"),
+    ("find", "Поиск"),
+    ("last", "Последние 5 записей"),
+    ("tz", "Настройка часового пояса"),
+    ("cancel", "Сброс текущего действия"),
+    ("help", "Перечень команд"),
+]
+COMMANDS_TEXT = "\n".join(f"/{cmd} — {desc.lower()}" for cmd, desc in BOT_COMMANDS)
 
 
-async def on_start(message: Message):
-    await show_main_menu(message.bot, message.chat.id)
+async def show_main_menu(target: Union[Message, CallbackQuery]):
+    markup = main_kb().as_markup()
+    if isinstance(target, CallbackQuery):
+        msg = target.message
+        if getattr(msg, "photo", None) or getattr(msg, "caption", None):
+            try:
+                await msg.edit_reply_markup()
+            except TelegramBadRequest:
+                pass
+            await msg.answer(MAIN_MENU_TEXT, reply_markup=markup)
+            return
+    await ui(target, MAIN_MENU_TEXT, reply_markup=markup)
+
+
+async def on_start(message: Message, state: FSMContext):
+    await state.clear()
+    await show_main_menu(message)
 
 
 async def help_cmd(message: Message):
-    await message.answer(
-        "/start — меню\n"
-        "/new — новая дегустация\n"
-        "/find — поиск (по названию, категории, году, рейтингу, последние 5)\n"
-        "/last — последние 5\n"
-        "/tz — часовой пояс\n"
-        "/menu — включить кнопки под вводом (сквозное меню)\n"
-        "/hide — скрыть кнопки\n"
-        "/cancel — сброс текущего действия\n"
-        "/edit <id> — редактировать заметку\n"
-        "/delete <id> — удалить запись"
-    )
+    await message.answer(COMMANDS_TEXT)
 
 
 async def cancel_cmd(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "Ок, сбросил. Возвращаю в меню.",
-        reply_markup=main_kb().as_markup(),
-    )
-
-
-async def menu_cmd(message: Message):
-    await message.answer(
-        "Включил кнопки под полем ввода.",
-        reply_markup=reply_main_kb(),
-    )
-
-
-async def hide_cmd(message: Message):
-    await message.answer("Скрываю кнопки.", reply_markup=ReplyKeyboardRemove())
-
-
-async def reply_buttons_router(message: Message, state: FSMContext):
-    t = (message.text or "").strip()
-    if "Новая дегустация" in t:
-        await new_cmd(message, state)
-    elif "Найти записи" in t:
-        await find_cmd(message)
-    elif "Последние 5" in t:
-        await last_cmd(message)
-    elif "Помощь" in t or "О боте" in t:
-        await help_cmd(message)
-    elif t == "Сброс" or t == "Отмена":
-        await cancel_cmd(message, state)
+    await message.answer("Ок, сбросил. Возвращаю в меню.")
+    await show_main_menu(message)
 
 
 async def help_cb(call: CallbackQuery):
-    await call.message.answer(
-        "/start — меню\n"
-        "/new — новая дегустация\n"
-        "/find — поиск (по названию, категории, году, рейтингу, последние 5)\n"
-        "/last — последние 5\n"
-        "/tz — часовой пояс\n"
-        "/menu — включить кнопки под вводом (сквозное меню)\n"
-        "/hide — скрыть кнопки\n"
-        "/cancel — сброс текущего действия\n"
-        "/edit <id> — редактировать заметку\n"
-        "/delete <id> — удалить запись",
-        reply_markup=search_menu_kb().as_markup(),
-    )
+    await ui(call, COMMANDS_TEXT, reply_markup=back_only_kb().as_markup())
     await call.answer()
 
 
-async def back_main(call: CallbackQuery):
-    await show_main_menu(call.message.bot, call.message.chat.id)
+async def back_main(call: CallbackQuery, state: FSMContext):
+    await show_main_menu(call)
     await call.answer()
 
 
@@ -2602,10 +2909,9 @@ async def tz_cmd(message: Message):
 def setup_handlers(dp: Dispatcher):
     # команды
     dp.message.register(on_start, CommandStart())
-    dp.message.register(help_cmd, Command("help"))
+    dp.message.register(cancel_cmd, F.text.casefold() == "сброс")
     dp.message.register(cancel_cmd, Command("cancel"))
-    dp.message.register(menu_cmd, Command("menu"))
-    dp.message.register(hide_cmd, Command("hide"))
+    dp.message.register(help_cmd, Command("help"))
     dp.message.register(new_cmd, Command("new"))
     dp.message.register(find_cmd, Command("find"))
     dp.message.register(last_cmd, Command("last"))
@@ -2631,6 +2937,7 @@ def setup_handlers(dp: Dispatcher):
     dp.message.register(inf_taste, InfusionState.taste)
     dp.message.register(inf_special, InfusionState.special)
     dp.message.register(inf_body_custom, InfusionState.body)
+    dp.message.register(aftertaste_custom, InfusionState.aftertaste)
 
     dp.message.register(rating_in, RatingSummary.rating)
     dp.message.register(summary_in, RatingSummary.summary)
@@ -2647,9 +2954,6 @@ def setup_handlers(dp: Dispatcher):
 
     # редактирование заметки
     dp.message.register(edit_flow_msg, EditFlow.waiting_text)
-
-    # reply-кнопки в самом конце!
-    dp.message.register(reply_buttons_router)
 
     # callbacks
     dp.callback_query.register(new_cb, F.data == "new")
@@ -2707,20 +3011,16 @@ def setup_handlers(dp: Dispatcher):
     # карточка
     dp.callback_query.register(open_card, F.data.startswith("open:"))
     dp.callback_query.register(edit_cb, F.data.startswith("edit:"))
+    dp.callback_query.register(edit_field_select, F.data.startswith("efld:"))
+    dp.callback_query.register(edit_category_pick, F.data.startswith("ecat:"))
+    dp.callback_query.register(edit_rating_pick, F.data.startswith("erate:"))
     dp.callback_query.register(del_cb, F.data.startswith("del:"))
     dp.callback_query.register(del_ok_cb, F.data.startswith("delok:"))
     dp.callback_query.register(del_no_cb, F.data.startswith("delno:"))
 
 
 async def set_bot_commands(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="new", description="Новая дегустация"),
-        BotCommand(command="find", description="Поиск"),
-        BotCommand(command="last", description="Последние 5"),
-        BotCommand(command="tz", description="Часовой пояс"),
-        BotCommand(command="help", description="Помощь"),
-    ]
+    commands = [BotCommand(command=cmd, description=desc) for cmd, desc in BOT_COMMANDS]
     await bot.set_my_commands(commands)
 
 
