@@ -180,11 +180,18 @@ def setup_db(db_url: str):
     + Твики для SQLite: WAL, NORMAL, кэши — меньше блокировок на дешёвом хостинге.
     """
     global SessionLocal
+    engine_kwargs: Dict[str, Any] = {
+        "echo": False,
+        "future": True,
+    }
+    if db_url.startswith("sqlite"):
+        engine_kwargs["connect_args"] = {
+            "check_same_thread": False
+        }  # безопасно и уменьшает «залипания»
+
     engine = create_engine(
         db_url,
-        echo=False,
-        future=True,
-        connect_args={"check_same_thread": False}  # безопасно и уменьшает «залипания»
+        **engine_kwargs,
     )
 
     # PRAGMA для SQLite
