@@ -27,6 +27,7 @@ from sqlalchemy import (
     ForeignKey,
     select,
 )
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -180,11 +181,14 @@ def setup_db(db_url: str):
     + Твики для SQLite: WAL, NORMAL, кэши — меньше блокировок на дешёвом хостинге.
     """
     global SessionLocal
+    url = make_url(db_url)
+    is_sqlite = url.get_backend_name() == "sqlite"
+
     engine_kwargs: Dict[str, Any] = {
         "echo": False,
         "future": True,
     }
-    if db_url.startswith("sqlite"):
+    if is_sqlite:
         engine_kwargs["connect_args"] = {
             "check_same_thread": False
         }  # безопасно и уменьшает «залипания»
@@ -195,7 +199,7 @@ def setup_db(db_url: str):
     )
 
     # PRAGMA для SQLite
-    if db_url.startswith("sqlite"):
+    if is_sqlite:
         with engine.connect() as conn:
             conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
             conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
