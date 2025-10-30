@@ -36,7 +36,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy import Index, desc
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -230,6 +230,7 @@ class Photo(Base):
 
 
 SessionLocal = None  # фабрика сессий
+engine: Optional[Engine] = None
 
 
 def setup_db(db_url: str):
@@ -237,7 +238,8 @@ def setup_db(db_url: str):
     Создаёт таблицы, если их нет.
     + Твики для SQLite: WAL, NORMAL, кэши — меньше блокировок на дешёвом хостинге.
     """
-    global SessionLocal
+    global SessionLocal, engine
+    old_engine = engine
     engine = create_engine(
         db_url,
         echo=False,
@@ -255,6 +257,8 @@ def setup_db(db_url: str):
 
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    if old_engine is not None:
+        old_engine.dispose()
 
     inspector = inspect(engine)
     with engine.begin() as conn:
@@ -3313,12 +3317,29 @@ async def restore_cmd(message: Message):
         if os.path.exists(cfg.db_path):
             shutil.copy2(cfg.db_path, backup_path)
         shutil.move(tmp_path, cfg.db_path)
+        try:
+            setup_db(cfg.db_url)
+        except Exception as exc:
+            logger.exception("Restore reinitialization failed: %s", exc)
+            if os.path.exists(backup_path):
+                shutil.move(backup_path, cfg.db_path)
+            else:
+                os.remove(cfg.db_path)
+            try:
+                setup_db(cfg.db_url)
+            except Exception:
+                logger.exception("Failed to restore previous database after reinit error")
+            await message.answer("Не удалось применить файл восстановления.")
+            return
     except Exception as exc:
         logger.exception("Restore failed: %s", exc)
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         await message.answer("Не удалось применить файл восстановления.")
         return
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
     await message.answer("✅ Восстановлено.")
 
