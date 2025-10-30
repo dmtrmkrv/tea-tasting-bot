@@ -3,9 +3,12 @@ import base64
 import datetime
 import logging
 import os
+import re
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -33,6 +36,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy import Index, desc
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -53,29 +57,68 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Settings:
     token: str
-    admin_id: Optional[int] = None
+    admin_ids: Set[int]
     db_url: str = "sqlite:///tastings.db"
+    db_path: Optional[str] = None
     banner_path: Optional[str] = None
 
 
 def get_settings() -> Settings:
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
-    admin = os.getenv("ADMIN_ID")
-    db_url = os.getenv("DB_URL", "sqlite:///tastings.db")
+    admins_raw = os.getenv("ADMINS")
+    if not admins_raw:
+        legacy_admin = os.getenv("ADMIN_ID")
+        admins_raw = legacy_admin or ""
+    db_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "sqlite:///tastings.db"
     banner = os.getenv("BANNER_PATH")
+    admin_ids: Set[int] = set()
+    invalid_admin_tokens: List[str] = []
+    for raw_token in re.split(r"[\s,]+", admins_raw or ""):
+        token = raw_token.strip()
+        if not token:
+            continue
+        try:
+            admin_ids.add(int(token))
+        except ValueError:
+            invalid_admin_tokens.append(token)
+    if invalid_admin_tokens:
+        logger.warning(
+            "Игнорирую некорректные значения ADMINS: %s",
+            ", ".join(invalid_admin_tokens),
+        )
+    db_path = None
+    try:
+        url = make_url(db_url)
+        if url.drivername.startswith("sqlite") and url.database and url.database != ":memory:":
+            db_path = os.path.abspath(url.database)
+    except Exception:
+        db_path = None
     return Settings(
         token=token,
-        admin_id=int(admin) if admin else None,
+        admin_ids=admin_ids,
         db_url=db_url,
+        db_path=db_path,
         banner_path=banner if banner and os.path.exists(banner) else None,
     )
 
 
-cfg: Settings  # присвоим в main()
+cfg: Optional[Settings] = None  # присвоим в main()
 
 
 # ---------------- БД ----------------
+
+
+def is_admin(user_id: Optional[int]) -> bool:
+    return bool(cfg and user_id is not None and user_id in cfg.admin_ids)
+
+
+async def ensure_admin(message: Message) -> bool:
+    if message.from_user and is_admin(message.from_user.id):
+        return True
+    await message.answer("Команда доступна только администраторам.")
+    return False
+
 
 class Base(DeclarativeBase):
     pass
@@ -187,6 +230,7 @@ class Photo(Base):
 
 
 SessionLocal = None  # фабрика сессий
+engine: Optional[Engine] = None
 
 
 def setup_db(db_url: str):
@@ -194,7 +238,8 @@ def setup_db(db_url: str):
     Создаёт таблицы, если их нет.
     + Твики для SQLite: WAL, NORMAL, кэши — меньше блокировок на дешёвом хостинге.
     """
-    global SessionLocal
+    global SessionLocal, engine
+    old_engine = engine
     engine = create_engine(
         db_url,
         echo=False,
@@ -212,6 +257,8 @@ def setup_db(db_url: str):
 
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    if old_engine is not None:
+        old_engine.dispose()
 
     inspector = inspect(engine)
     with engine.begin() as conn:
@@ -3177,7 +3224,7 @@ async def on_start(message: Message):
 
 
 async def help_cmd(message: Message):
-    await message.answer(
+    text = (
         "/start — меню\n"
         "/new — новая дегустация\n"
         "/find — поиск (по названию, категории, году, рейтингу, последние 5)\n"
@@ -3190,6 +3237,12 @@ async def help_cmd(message: Message):
         "/edit <id или #N> — редактировать запись\n"
         "/delete <id или #N> — удалить запись"
     )
+    if message.from_user and is_admin(message.from_user.id):
+        text += (
+            "\n/backup — бэкап БД (admin)\n"
+            "/restore — восстановление БД (admin, ответом на документ)"
+        )
+    await message.answer(text)
 
 
 async def cancel_cmd(message: Message, state: FSMContext):
@@ -3215,6 +3268,82 @@ async def hide_cmd(message: Message):
     await message.answer("Скрываю кнопки.", reply_markup=ReplyKeyboardRemove())
 
 
+async def backup_cmd(message: Message):
+    if not await ensure_admin(message):
+        return
+    if not cfg or not cfg.db_path:
+        await message.answer("Для бэкапа нужна SQLite-база данных.")
+        return
+    if not os.path.exists(cfg.db_path):
+        await message.answer("Файл базы данных не найден.")
+        return
+
+    file_name = os.path.basename(cfg.db_path)
+    await message.answer_document(
+        FSInputFile(cfg.db_path, filename=file_name),
+        caption=f"Бэкап {file_name}",
+    )
+
+
+async def restore_cmd(message: Message):
+    if not await ensure_admin(message):
+        return
+    if not cfg or not cfg.db_path:
+        await message.answer("Для восстановления нужна SQLite-база данных.")
+        return
+
+    reply = message.reply_to_message
+    document = reply.document if reply else None
+    if not document:
+        await message.answer(
+            "Пришлите /restore ответом на документ с файлом базы данных."
+        )
+        return
+
+    os.makedirs(os.path.dirname(cfg.db_path) or ".", exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="restore_", suffix=".db")
+    os.close(fd)
+    try:
+        await message.bot.download(document, destination=tmp_path)
+    except Exception as exc:
+        logger.exception("Restore download failed: %s", exc)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        await message.answer("Не удалось скачать файл для восстановления.")
+        return
+
+    backup_path = cfg.db_path + ".bak"
+    try:
+        if os.path.exists(cfg.db_path):
+            shutil.copy2(cfg.db_path, backup_path)
+        shutil.move(tmp_path, cfg.db_path)
+        try:
+            setup_db(cfg.db_url)
+        except Exception as exc:
+            logger.exception("Restore reinitialization failed: %s", exc)
+            if os.path.exists(backup_path):
+                shutil.move(backup_path, cfg.db_path)
+            else:
+                os.remove(cfg.db_path)
+            try:
+                setup_db(cfg.db_url)
+            except Exception:
+                logger.exception("Failed to restore previous database after reinit error")
+            await message.answer("Не удалось применить файл восстановления.")
+            return
+    except Exception as exc:
+        logger.exception("Restore failed: %s", exc)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        await message.answer("Не удалось применить файл восстановления.")
+        return
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    await message.answer("✅ Восстановлено.")
+
+
 async def reply_buttons_router(message: Message, state: FSMContext):
     t = (message.text or "").strip()
     if "Новая дегустация" in t:
@@ -3230,7 +3359,7 @@ async def reply_buttons_router(message: Message, state: FSMContext):
 
 
 async def help_cb(call: CallbackQuery):
-    await call.message.answer(
+    text = (
         "/start — меню\n"
         "/new — новая дегустация\n"
         "/find — поиск (по названию, категории, году, рейтингу, последние 5)\n"
@@ -3241,7 +3370,15 @@ async def help_cb(call: CallbackQuery):
         "/reset — сброс и возврат в меню\n"
         "/cancel — сброс текущего действия\n"
         "/edit <id или #N> — редактировать запись\n"
-        "/delete <id или #N> — удалить запись",
+        "/delete <id или #N> — удалить запись"
+    )
+    if call.from_user and is_admin(call.from_user.id):
+        text += (
+            "\n/backup — бэкап БД (admin)\n"
+            "/restore — восстановление БД (admin, ответом на документ)"
+        )
+    await call.message.answer(
+        text,
         reply_markup=search_menu_kb().as_markup(),
     )
     await call.answer()
@@ -3305,6 +3442,8 @@ def setup_handlers(dp: Dispatcher):
     # команды
     dp.message.register(on_start, CommandStart())
     dp.message.register(help_cmd, Command("help"))
+    dp.message.register(backup_cmd, Command("backup"))
+    dp.message.register(restore_cmd, Command("restore"))
     dp.message.register(cancel_cmd, Command("cancel"))
     dp.message.register(reset_cmd, Command("reset"))
     dp.message.register(menu_cmd, Command("menu"))
@@ -3432,6 +3571,13 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="reset", description="Сброс и меню"),
         BotCommand(command="help", description="Помощь"),
     ]
+    if cfg and cfg.admin_ids:
+        commands.extend(
+            [
+                BotCommand(command="backup", description="Бэкап базы (admin)"),
+                BotCommand(command="restore", description="Восстановление БД (admin)"),
+            ]
+        )
     await bot.set_my_commands(commands)
 
 
@@ -3440,6 +3586,15 @@ async def set_bot_commands(bot: Bot):
 async def main():
     global cfg
     cfg = get_settings()
+    env_name = os.getenv("ENV", "production")
+    db_location = cfg.db_path or cfg.db_url
+    logger.info(
+        "ENV=%s DB=%s PAGE_SIZE=%s PHOTO_LIMIT=%s",
+        env_name,
+        db_location,
+        PAGE_SIZE,
+        MAX_PHOTOS,
+    )
     setup_db(cfg.db_url)
 
     # Опционально: ускорить event loop, если добавишь uvloop в requirements
