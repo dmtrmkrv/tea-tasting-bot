@@ -2,6 +2,7 @@ import asyncio
 import base64
 import datetime
 import logging
+import re
 import os
 import shutil
 import tempfile
@@ -62,12 +63,12 @@ def _raw_admins_string() -> str:
     legacy_admin = os.getenv("ADMIN_ID", "").strip()
     if legacy_admin:
         admins_env = f"{admins_env},{legacy_admin}" if admins_env else legacy_admin
-    return admins_env.replace(" ", "")
+    return admins_env
 
 
 def _parse_admins() -> Tuple[Set[int], List[str]]:
     admins_raw = _raw_admins_string()
-    tokens = [token for token in admins_raw.split(",") if token]
+    tokens = [token for token in re.split(r"[\s,]+", admins_raw) if token]
     admins = {int(token) for token in tokens if token.strip().isdigit()}
     invalid = [token for token in tokens if token and not token.strip().isdigit()]
     return admins, invalid
