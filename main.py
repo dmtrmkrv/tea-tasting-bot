@@ -2,8 +2,8 @@ import asyncio
 import base64
 import datetime
 import logging
-import os
 import re
+import os
 import shutil
 import tempfile
 import time
@@ -51,8 +51,36 @@ from sqlalchemy.orm import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+load_dotenv()
+
+ENV = os.getenv("ENV", "production")
+
 
 # ---------------- НАСТРОЙКИ ----------------
+
+def _raw_admins_string() -> str:
+    admins_env = os.getenv("ADMINS", "")
+    legacy_admin = os.getenv("ADMIN_ID", "").strip()
+    if legacy_admin:
+        admins_env = f"{admins_env},{legacy_admin}" if admins_env else legacy_admin
+    return admins_env
+
+
+def _parse_admins() -> Tuple[Set[int], List[str]]:
+    admins_raw = _raw_admins_string()
+    tokens = [token for token in re.split(r"[\s,]+", admins_raw) if token]
+    admins = {int(token) for token in tokens if token.strip().isdigit()}
+    invalid = [token for token in tokens if token and not token.strip().isdigit()]
+    return admins, invalid
+
+
+ADMINS, _invalid_admin_tokens = _parse_admins()
+if _invalid_admin_tokens:
+    logger.warning(
+        "Игнорирую некорректные значения ADMINS: %s",
+        ", ".join(_invalid_admin_tokens),
+    )
+
 
 @dataclass
 class Settings:
@@ -64,29 +92,9 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    load_dotenv()
     token = os.getenv("BOT_TOKEN")
-    admins_raw = os.getenv("ADMINS")
-    if not admins_raw:
-        legacy_admin = os.getenv("ADMIN_ID")
-        admins_raw = legacy_admin or ""
     db_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "sqlite:///tastings.db"
     banner = os.getenv("BANNER_PATH")
-    admin_ids: Set[int] = set()
-    invalid_admin_tokens: List[str] = []
-    for raw_token in re.split(r"[\s,]+", admins_raw or ""):
-        token = raw_token.strip()
-        if not token:
-            continue
-        try:
-            admin_ids.add(int(token))
-        except ValueError:
-            invalid_admin_tokens.append(token)
-    if invalid_admin_tokens:
-        logger.warning(
-            "Игнорирую некорректные значения ADMINS: %s",
-            ", ".join(invalid_admin_tokens),
-        )
     db_path = None
     try:
         url = make_url(db_url)
@@ -96,7 +104,7 @@ def get_settings() -> Settings:
         db_path = None
     return Settings(
         token=token,
-        admin_ids=admin_ids,
+        admin_ids=set(ADMINS),
         db_url=db_url,
         db_path=db_path,
         banner_path=banner if banner and os.path.exists(banner) else None,
@@ -110,14 +118,22 @@ cfg: Optional[Settings] = None  # присвоим в main()
 
 
 def is_admin(user_id: Optional[int]) -> bool:
-    return bool(cfg and user_id is not None and user_id in cfg.admin_ids)
+    return bool(user_id is not None and user_id in ADMINS)
 
 
-async def ensure_admin(message: Message) -> bool:
+async def ensure_admin_message(message: Message) -> bool:
     if message.from_user and is_admin(message.from_user.id):
         return True
-    await message.answer("Команда доступна только администраторам.")
+    await message.answer("Команда доступна только админам.")
     return False
+
+
+def resolved_db_path() -> str:
+    if cfg and cfg.db_path:
+        return cfg.db_path
+    if cfg:
+        return cfg.db_url
+    return os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "sqlite:///tastings.db"
 
 
 class Base(DeclarativeBase):
@@ -436,6 +452,7 @@ AFTERTASTE_SET = [
 
 PAGE_SIZE = 5
 MAX_PHOTOS = 3
+PHOTO_LIMIT = MAX_PHOTOS
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
 ALBUM_TIMEOUT = 2.0
@@ -3240,7 +3257,8 @@ async def help_cmd(message: Message):
     if message.from_user and is_admin(message.from_user.id):
         text += (
             "\n/backup — бэкап БД (admin)\n"
-            "/restore — восстановление БД (admin, ответом на документ)"
+            "/restore — восстановление БД (admin, ответом на документ)\n"
+            "/dbinfo — информация об окружении и БД (admin)"
         )
     await message.answer(text)
 
@@ -3268,8 +3286,9 @@ async def hide_cmd(message: Message):
     await message.answer("Скрываю кнопки.", reply_markup=ReplyKeyboardRemove())
 
 
-async def backup_cmd(message: Message):
-    if not await ensure_admin(message):
+async def backup_cmd(message: Message, _state: FSMContext):
+    logger.info("Entered /backup")
+    if not await ensure_admin_message(message):
         return
     if not cfg or not cfg.db_path:
         await message.answer("Для бэкапа нужна SQLite-база данных.")
@@ -3285,8 +3304,9 @@ async def backup_cmd(message: Message):
     )
 
 
-async def restore_cmd(message: Message):
-    if not await ensure_admin(message):
+async def restore_cmd(message: Message, _state: FSMContext):
+    logger.info("Entered /restore")
+    if not await ensure_admin_message(message):
         return
     if not cfg or not cfg.db_path:
         await message.answer("Для восстановления нужна SQLite-база данных.")
@@ -3344,6 +3364,20 @@ async def restore_cmd(message: Message):
     await message.answer("✅ Восстановлено.")
 
 
+async def dbinfo_cmd(message: Message):
+    logger.info("Entered /dbinfo")
+    if not await ensure_admin_message(message):
+        return
+    await message.answer(
+        "ENV={env}\nDB={db}\nPAGE_SIZE={page}\nPHOTO_LIMIT={photo}".format(
+            env=ENV,
+            db=resolved_db_path(),
+            page=PAGE_SIZE,
+            photo=PHOTO_LIMIT,
+        )
+    )
+
+
 async def reply_buttons_router(message: Message, state: FSMContext):
     t = (message.text or "").strip()
     if "Новая дегустация" in t:
@@ -3375,7 +3409,8 @@ async def help_cb(call: CallbackQuery):
     if call.from_user and is_admin(call.from_user.id):
         text += (
             "\n/backup — бэкап БД (admin)\n"
-            "/restore — восстановление БД (admin, ответом на документ)"
+            "/restore — восстановление БД (admin, ответом на документ)\n"
+            "/dbinfo — информация об окружении и БД (admin)"
         )
     await call.message.answer(
         text,
@@ -3444,6 +3479,7 @@ def setup_handlers(dp: Dispatcher):
     dp.message.register(help_cmd, Command("help"))
     dp.message.register(backup_cmd, Command("backup"))
     dp.message.register(restore_cmd, Command("restore"))
+    dp.message.register(dbinfo_cmd, Command("dbinfo"))
     dp.message.register(cancel_cmd, Command("cancel"))
     dp.message.register(reset_cmd, Command("reset"))
     dp.message.register(menu_cmd, Command("menu"))
@@ -3576,6 +3612,7 @@ async def set_bot_commands(bot: Bot):
             [
                 BotCommand(command="backup", description="Бэкап базы (admin)"),
                 BotCommand(command="restore", description="Восстановление БД (admin)"),
+                BotCommand(command="dbinfo", description="Инфо о БД (admin)"),
             ]
         )
     await bot.set_my_commands(commands)
@@ -3586,14 +3623,14 @@ async def set_bot_commands(bot: Bot):
 async def main():
     global cfg
     cfg = get_settings()
-    env_name = os.getenv("ENV", "production")
-    db_location = cfg.db_path or cfg.db_url
+    db_location = resolved_db_path()
     logger.info(
-        "ENV=%s DB=%s PAGE_SIZE=%s PHOTO_LIMIT=%s",
-        env_name,
+        "ENV=%s DB=%s PAGE_SIZE=%s PHOTO_LIMIT=%s ADMINS=%s",
+        ENV,
         db_location,
         PAGE_SIZE,
-        MAX_PHOTOS,
+        PHOTO_LIMIT,
+        sorted(ADMINS) if ADMINS else [],
     )
     setup_db(cfg.db_url)
 
