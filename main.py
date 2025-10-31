@@ -3286,7 +3286,7 @@ async def hide_cmd(message: Message):
     await message.answer("Скрываю кнопки.", reply_markup=ReplyKeyboardRemove())
 
 
-async def backup_cmd(message: Message, _state: FSMContext):
+async def backup_cmd(message: Message, state: FSMContext):
     logger.info("Entered /backup")
     if not await ensure_admin_message(message):
         return
@@ -3304,7 +3304,7 @@ async def backup_cmd(message: Message, _state: FSMContext):
     )
 
 
-async def restore_cmd(message: Message, _state: FSMContext):
+async def restore_cmd(message: Message, state: FSMContext):
     logger.info("Entered /restore")
     if not await ensure_admin_message(message):
         return
@@ -3364,7 +3364,7 @@ async def restore_cmd(message: Message, _state: FSMContext):
     await message.answer("✅ Восстановлено.")
 
 
-async def dbinfo_cmd(message: Message):
+async def dbinfo_cmd(message: Message, state: FSMContext):
     logger.info("Entered /dbinfo")
     if not await ensure_admin_message(message):
         return
