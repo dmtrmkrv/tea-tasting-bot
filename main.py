@@ -46,14 +46,41 @@ from sqlalchemy.orm import (
 )
 # fmt: on
 
-# ---------------- ЛОГИ ----------------
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------------- ОКРУЖЕНИЕ И ЛОГИ ----------------
 
 load_dotenv()
 
-ENV = os.getenv("ENV", "production")
+_LEGACY_ENV = os.getenv("ENV")
+APP_ENV = os.getenv("APP_ENV") or _LEGACY_ENV or "production"
+
+_log_level = logging.DEBUG if APP_ENV.lower() != "production" else logging.INFO
+logging.basicConfig(level=_log_level)
+logger = logging.getLogger(__name__)
+
+
+def _int_from_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Игнорирую некорректное значение %s=%r", name, raw)
+        return default
+
+
+_legacy_db_url = os.getenv("DB_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") or _legacy_db_url or "sqlite:///tastings.db"
+PAGE_SIZE = _int_from_env("PAGE_SIZE", 5)
+_photo_limit_raw = os.getenv("PHOTO_LIMIT")
+if _photo_limit_raw is not None and _photo_limit_raw.strip():
+    PHOTO_LIMIT = _int_from_env("PHOTO_LIMIT", 3)
+else:
+    PHOTO_LIMIT = _int_from_env("MAX_PHOTOS", 3)
+MAX_PHOTOS = PHOTO_LIMIT
 
 
 # ---------------- НАСТРОЙКИ ----------------
@@ -86,14 +113,14 @@ if _invalid_admin_tokens:
 class Settings:
     token: str
     admin_ids: Set[int]
-    db_url: str = "sqlite:///tastings.db"
+    db_url: str = DATABASE_URL
     db_path: Optional[str] = None
     banner_path: Optional[str] = None
 
 
 def get_settings() -> Settings:
     token = os.getenv("BOT_TOKEN")
-    db_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "sqlite:///tastings.db"
+    db_url = DATABASE_URL
     banner = os.getenv("BANNER_PATH")
     db_path = None
     try:
@@ -133,7 +160,23 @@ def resolved_db_path() -> str:
         return cfg.db_path
     if cfg:
         return cfg.db_url
-    return os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "sqlite:///tastings.db"
+    return DATABASE_URL
+
+
+def environment_summary() -> str:
+    env_display = _LEGACY_ENV or "-"
+    admins_display: List[int] = sorted(ADMINS) if ADMINS else []
+    return (
+        "APP_ENV={app_env} | ENV={env} | DB={db} | PAGE_SIZE={page} | "
+        "PHOTO_LIMIT={photo} | ADMINS={admins}"
+    ).format(
+        app_env=APP_ENV,
+        env=env_display,
+        db=resolved_db_path(),
+        page=PAGE_SIZE,
+        photo=PHOTO_LIMIT,
+        admins=admins_display,
+    )
 
 
 class Base(DeclarativeBase):
@@ -450,9 +493,6 @@ AFTERTASTE_SET = [
     "землистый",
 ]
 
-PAGE_SIZE = 5
-MAX_PHOTOS = 3
-PHOTO_LIMIT = MAX_PHOTOS
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
 ALBUM_TIMEOUT = 2.0
@@ -3368,14 +3408,7 @@ async def dbinfo_cmd(message: Message, state: FSMContext):
     logger.info("Entered /dbinfo")
     if not await ensure_admin_message(message):
         return
-    await message.answer(
-        "ENV={env}\nDB={db}\nPAGE_SIZE={page}\nPHOTO_LIMIT={photo}".format(
-            env=ENV,
-            db=resolved_db_path(),
-            page=PAGE_SIZE,
-            photo=PHOTO_LIMIT,
-        )
-    )
+    await message.answer(environment_summary())
 
 
 async def reply_buttons_router(message: Message, state: FSMContext):
@@ -3623,15 +3656,7 @@ async def set_bot_commands(bot: Bot):
 async def main():
     global cfg
     cfg = get_settings()
-    db_location = resolved_db_path()
-    logger.info(
-        "ENV=%s DB=%s PAGE_SIZE=%s PHOTO_LIMIT=%s ADMINS=%s",
-        ENV,
-        db_location,
-        PAGE_SIZE,
-        PHOTO_LIMIT,
-        sorted(ADMINS) if ADMINS else [],
-    )
+    logger.info(environment_summary())
     setup_db(cfg.db_url)
 
     # Опционально: ускорить event loop, если добавишь uvloop в requirements
