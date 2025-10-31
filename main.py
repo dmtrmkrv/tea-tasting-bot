@@ -72,7 +72,8 @@ def _int_from_env(name: str, default: int) -> int:
         return default
 
 
-DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///tastings.db"
+_legacy_db_url = os.getenv("DB_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") or _legacy_db_url or "sqlite:///tastings.db"
 PAGE_SIZE = _int_from_env("PAGE_SIZE", 5)
 _photo_limit_raw = os.getenv("PHOTO_LIMIT")
 if _photo_limit_raw is not None and _photo_limit_raw.strip():
