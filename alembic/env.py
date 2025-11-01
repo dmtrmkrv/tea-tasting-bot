@@ -1,4 +1,5 @@
 import os
+from urllib.parse import quote_plus
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
@@ -12,9 +13,16 @@ target_metadata = Base.metadata
 
 def get_url():
     url = os.getenv("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is not set for Alembic")
-    return url
+    if url:
+        return url
+    host = os.getenv("POSTGRESQL_HOST")
+    port = os.getenv("POSTGRESQL_PORT", "5432")
+    user = os.getenv("POSTGRESQL_USER")
+    password = os.getenv("POSTGRESQL_PASSWORD")
+    dbname = os.getenv("POSTGRESQL_DBNAME")
+    if all([host, user, password, dbname]):
+        return f"postgresql+psycopg://{user}:{quote_plus(password)}@{host}:{port}/{dbname}"
+    raise RuntimeError("Set DATABASE_URL or POSTGRESQL_HOST/PORT/USER/PASSWORD/DBNAME")
 
 def run_migrations_offline():
     context.configure(url=get_url(), target_metadata=target_metadata, literal_binds=True, compare_type=True)
