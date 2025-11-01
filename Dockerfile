@@ -6,10 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TZ=Europe/Moscow \
     PYTHONPATH=/app
 
+ARG DEBIAN_FRONTEND=noninteractive
+
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libjpeg62-turbo-dev zlib1g-dev libpng-dev ca-certificates tzdata \
+ && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
+ && dpkg-reconfigure --frontend noninteractive tzdata \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
