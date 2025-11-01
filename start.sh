@@ -1,41 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -n "${POSTGRESQL_HOST:-}" ]]; then
-  WAIT_TARGET="${POSTGRESQL_HOST}:${POSTGRESQL_PORT:-5432}"
-elif [[ -n "${DATABASE_URL:-}" ]]; then
-  WAIT_TARGET="${DATABASE_URL}"
-else
-  echo "[start] PostgreSQL connection details are not configured." >&2
-  exit 2
-fi
-
-echo "[start] Waiting for Postgres ${WAIT_TARGET} ..."
+echo "[start] Waiting for Postgres ${POSTGRESQL_HOST:-<via DATABASE_URL>}:${POSTGRESQL_PORT:-5432} ..."
 TRY=0
 until python - <<'PY'
 import os
-import sys
+from urllib.parse import quote_plus
 from sqlalchemy import create_engine, text
 
-
-def build_url() -> str:
-    user = os.getenv("POSTGRESQL_USER")
-    pwd = os.getenv("POSTGRESQL_PASSWORD")
-    host = os.getenv("POSTGRESQL_HOST")
-    db = os.getenv("POSTGRESQL_DBNAME")
-    port = os.getenv("POSTGRESQL_PORT", "5432")
-    ssl = os.getenv("POSTGRESQL_SSLMODE")
-    if all([user, pwd, host, db]):
-        query = f"?sslmode={ssl}" if ssl else ""
-        return f"postgresql+psycopg://{user}:{pwd}@{host}:{port}/{db}{query}"
-
+def build_url():
+    # 1) приоритет — готовая строка
     url = os.getenv("DATABASE_URL")
     if url:
         return url
 
-    print("[start] PostgreSQL connection details are not configured.", file=sys.stderr)
-    raise SystemExit(2)
+    # 2) иначе склеиваем из POSTGRESQL_*
+    host = os.getenv("POSTGRESQL_HOST")
+    user = os.getenv("POSTGRESQL_USER")
+    password = os.getenv("POSTGRESQL_PASSWORD")
+    dbname = os.getenv("POSTGRESQL_DBNAME")
+    port = os.getenv("POSTGRESQL_PORT", "5432")
+    if not all([host, user, password, dbname]):
+        raise SystemExit("DB env missing: set DATABASE_URL or POSTGRESQL_HOST/USER/PASSWORD/DBNAME")
 
+    ssl = os.getenv("POSTGRESQL_SSLMODE")  # 'require' | 'disable' | None
+    query = f"?sslmode={ssl}" if ssl else ""
+    return f"postgresql+psycopg://{user}:{quote_plus(password)}@{host}:{port}/{dbname}{query}"
 
 url = build_url()
 try:
