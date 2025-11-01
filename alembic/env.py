@@ -27,8 +27,10 @@ def build_db_url():
     user = os.getenv("POSTGRESQL_USER")
     password = os.getenv("POSTGRESQL_PASSWORD")
     dbname = os.getenv("POSTGRESQL_DBNAME")
+    sslmode = os.getenv("POSTGRESQL_SSLMODE")  # 'require' | 'disable' | None
+    query = f"?sslmode={sslmode}" if sslmode else ""
     if all([host, user, password, dbname]):
-        return f"postgresql+psycopg://{user}:{quote_plus(password)}@{host}:{port}/{dbname}"
+        return f"postgresql+psycopg://{user}:{quote_plus(password)}@{host}:{port}/{dbname}{query}"
     raise RuntimeError("Set DATABASE_URL or POSTGRESQL_HOST/PORT/USER/PASSWORD/DBNAME")
 
 def run_migrations_offline():

@@ -10,9 +10,11 @@ def _build_db_url_from_parts():
     user = os.getenv("POSTGRESQL_USER")
     password = os.getenv("POSTGRESQL_PASSWORD")
     dbname = os.getenv("POSTGRESQL_DBNAME")
+    sslmode = os.getenv("POSTGRESQL_SSLMODE")  # 'require' | 'disable' | None
+    query = f"?sslmode={sslmode}" if sslmode else ""
     if all([host, user, password, dbname]):
         pw = urllib.parse.quote_plus(password)
-        return f"postgresql+psycopg://{user}:{pw}@{host}:{port}/{dbname}"
+        return f"postgresql+psycopg://{user}:{pw}@{host}:{port}/{dbname}{query}"
     return None
 
 
