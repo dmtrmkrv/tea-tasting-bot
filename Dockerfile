@@ -21,5 +21,8 @@ RUN python -m pip install --upgrade pip && pip install --no-cache-dir -r require
 
 COPY . .
 
-# Миграции БД и старт бота
-CMD bash -lc "alembic upgrade head && python -u main.py"
+# дать права на запуск
+RUN chmod +x /app/start.sh
+
+# запуск: ждем БД -> миграции -> бот
+CMD ["/app/start.sh"]
