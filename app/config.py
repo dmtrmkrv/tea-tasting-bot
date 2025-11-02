@@ -72,7 +72,7 @@ def get_db_url() -> str:
         return database_url
 
     postgres_values = {key: _env(env) for key, env in POSTGRES_ENVS.items()}
-    required_postgres_keys = {"host", "dbname", "user", "password"}
+    required_postgres_keys = {"host", "dbname", "user"}
 
     if all(postgres_values[key] for key in required_postgres_keys):
         raw_port = postgres_values["port"] or "5432"
