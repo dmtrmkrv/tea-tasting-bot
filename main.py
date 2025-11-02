@@ -9,6 +9,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -33,6 +34,7 @@ from sqlalchemy import (
     func,
     inspect,
     select,
+    text,
 )
 from sqlalchemy import Index, desc
 from sqlalchemy.engine import Engine, make_url
@@ -156,28 +158,108 @@ async def ensure_admin_message(message: Message) -> bool:
     return False
 
 
-def resolved_db_path() -> str:
-    if cfg and cfg.db_path:
-        return cfg.db_path
-    if cfg:
-        return cfg.db_url
-    return DATABASE_URL
+def _resolved_db_url_str() -> str:
+    if cfg and cfg.db_url:
+        return str(cfg.db_url)
+    raw = os.getenv("DATABASE_URL")
+    if raw:
+        return raw
+    try:
+        built = build_db_url_from_env(os)
+    except Exception:
+        return DATABASE_URL
+    return str(built)
+
+
+def _abbrev(value: Optional[str], left: int = 6, right: int = 6) -> str:
+    if not value:
+        return "-"
+    if len(value) <= left + right + 3:
+        return value
+    return f"{value[:left]}...{value[-right:]}"
+
+
+def _detect_photo_backend() -> str:
+    configured = (os.getenv("PHOTOS_BACKEND") or "").strip().lower()
+    if configured in {"local", "s3"}:
+        return configured
+    required = ["S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"]
+    if all(os.getenv(name) for name in required):
+        return "s3"
+    return "local"
+
+
+def _s3_endpoint_host(raw: Optional[str]) -> str:
+    if not raw:
+        return "-"
+    parsed = urlparse(raw)
+    if not parsed.scheme:
+        parsed = urlparse(f"https://{raw}")
+    host = parsed.netloc or parsed.path
+    return host or "-"
 
 
 def environment_summary() -> str:
-    env_display = _LEGACY_ENV or "-"
-    admins_display: List[int] = sorted(ADMINS) if ADMINS else []
-    return (
-        "APP_ENV={app_env} | ENV={env} | DB={db} | PAGE_SIZE={page} | "
-        "PHOTO_LIMIT={photo} | ADMINS={admins}"
-    ).format(
-        app_env=APP_ENV,
-        env=env_display,
-        db=resolved_db_path(),
-        page=PAGE_SIZE,
-        photo=PHOTO_LIMIT,
-        admins=admins_display,
-    )
+    db_url_str = _resolved_db_url_str()
+    db_driver = "-"
+    db_name = "-"
+    db_host = "-"
+    db_sslmode = "-"
+
+    try:
+        url = make_url(db_url_str)
+        db_driver = url.drivername or "-"
+        if (url.drivername or "").startswith("sqlite"):
+            db_name = url.database or "-"
+        else:
+            db_name = url.database or "-"
+            db_host = url.host or "-"
+            db_sslmode = url.query.get("sslmode") or "-"
+    except Exception:
+        pass
+
+    db_status = "OK"
+    if engine is None:
+        db_status = "FAIL (not initialized)"
+    else:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except Exception as exc:
+            db_status = f"FAIL ({type(exc).__name__})"
+
+    photo_backend = _detect_photo_backend()
+
+    s3_endpoint_raw = os.getenv("S3_ENDPOINT_URL")
+    s3_bucket_raw = os.getenv("S3_BUCKET")
+    s3_endpoint = _s3_endpoint_host(s3_endpoint_raw)
+    s3_bucket = _abbrev(s3_bucket_raw)
+
+    if photo_backend == "s3":
+        required = ["S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"]
+        missing = [name for name in required if not os.getenv(name)]
+        if missing:
+            s3_status = f"WARN (missing: {', '.join(missing)})"
+        else:
+            s3_status = "OK"
+    else:
+        s3_status = "WARN (не настроено)"
+
+    lines = [
+        (
+            "DB: {driver} | db={db_name} | host={host} | sslmode={sslmode} | status={status}".format(
+                driver=db_driver,
+                db_name=db_name or "-",
+                host=db_host or "-",
+                sslmode=db_sslmode or "-",
+                status=db_status,
+            )
+        ),
+        f"Photos: backend={photo_backend}",
+        f"S3: endpoint={s3_endpoint} | bucket={s3_bucket} | status={s3_status}",
+    ]
+
+    return "\n".join(lines)
 
 
 class Base(DeclarativeBase):
@@ -3679,8 +3761,8 @@ async def set_bot_commands(bot: Bot):
 async def main():
     global cfg
     cfg = get_settings()
-    logger.info(environment_summary())
     setup_db(cfg.db_url)
+    logger.info(environment_summary())
 
     # Опционально: ускорить event loop, если добавишь uvloop в requirements
     try:
