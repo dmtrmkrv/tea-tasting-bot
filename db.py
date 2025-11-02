@@ -12,13 +12,13 @@ def build_db_url_from_env(os, sqlite_default="/app/tastings.db"):
     pg_user = os.getenv("POSTGRESQL_USER")
     pg_password = os.getenv("POSTGRESQL_PASSWORD")
 
-    if all([pg_host, pg_db, pg_user, pg_password]):
+    if all([pg_host, pg_db, pg_user]):
         pg_port = os.getenv("POSTGRESQL_PORT") or "5432"
         pg_sslmode = os.getenv("POSTGRESQL_SSLMODE", "disable")
         return URL.create(
             drivername="postgresql+psycopg",  # psycopg3
             username=pg_user,
-            password=pg_password,
+            password=pg_password or None,
             host=pg_host,
             port=int(pg_port),
             database=pg_db,
