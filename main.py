@@ -47,6 +47,8 @@ from sqlalchemy.orm import (
 )
 # fmt: on
 
+import boto3
+
 from db import build_db_url_from_env, create_sa_engine
 
 # ---------------- ОКРУЖЕНИЕ И ЛОГИ ----------------
@@ -200,6 +202,7 @@ def _s3_endpoint_host(raw: Optional[str]) -> str:
 
 
 def environment_summary() -> str:
+    global db_health_status, s3_health_status
     db_url_str = _resolved_db_url_str()
     db_driver = "-"
     db_name = "-"
@@ -218,15 +221,18 @@ def environment_summary() -> str:
     except Exception:
         pass
 
-    db_status = "OK"
+    db_status = db_health_status
     if engine is None:
         db_status = "FAIL (not initialized)"
-    else:
+    elif db_status == "WARN (не проверено)":
         try:
             with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
+            db_status = "OK"
         except Exception as exc:
             db_status = f"FAIL ({type(exc).__name__})"
+        finally:
+            db_health_status = db_status
 
     photo_backend = _detect_photo_backend()
 
@@ -235,15 +241,16 @@ def environment_summary() -> str:
     s3_endpoint = _s3_endpoint_host(s3_endpoint_raw)
     s3_bucket = _abbrev(s3_bucket_raw)
 
+    if s3_bucket_raw:
+        s3_status = s3_health_status or "WARN (не проверено)"
+    else:
+        s3_status = "WARN (не настроено)"
+
     if photo_backend == "s3":
         required = ["S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET"]
         missing = [name for name in required if not os.getenv(name)]
         if missing:
             s3_status = f"WARN (missing: {', '.join(missing)})"
-        else:
-            s3_status = "OK"
-    else:
-        s3_status = "WARN (не настроено)"
 
     lines = [
         (
@@ -373,6 +380,26 @@ class Photo(Base):
 
 SessionLocal = None  # фабрика сессий
 engine: Optional[Engine] = None
+db_health_status: str = "WARN (не проверено)"
+s3_health_status: str = "WARN (не настроено)"
+
+
+def s3_health() -> None:
+    global s3_health_status
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+            region_name=os.getenv("S3_REGION"),
+            aws_access_key_id=os.getenv("S3_ACCESS_KEY"),
+            aws_secret_access_key=os.getenv("S3_SECRET_KEY"),
+        )
+        s3.list_objects_v2(Bucket=os.getenv("S3_BUCKET"), MaxKeys=1)
+        print("[S3] OK")
+        s3_health_status = "OK"
+    except Exception as e:
+        print(f"[S3] WARN: {e}")
+        s3_health_status = f"WARN ({type(e).__name__})"
 
 
 def setup_db(db_url: str):
@@ -380,7 +407,7 @@ def setup_db(db_url: str):
     Создаёт таблицы, если их нет.
     + Твики для SQLite: WAL, NORMAL, кэши — меньше блокировок на дешёвом хостинге.
     """
-    global SessionLocal, engine
+    global SessionLocal, engine, db_health_status, s3_health_status
     old_engine = engine
     env_db_url = build_db_url_from_env(os)
     if db_url and db_url != DATABASE_URL:
@@ -409,6 +436,21 @@ def setup_db(db_url: str):
     if pwd:
         safe_db_url = safe_db_url.replace(pwd, "***")
     print(f"[DB] Using: {safe_db_url}")
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("select 1"))
+        print("[DB] OK")
+        db_health_status = "OK"
+    except Exception as e:
+        print(f"[DB] FAIL: {e}")
+        db_health_status = f"FAIL ({type(e).__name__})"
+
+    if os.getenv("S3_BUCKET"):
+        s3_health()
+    else:
+        s3_health_status = "WARN (не настроено)"
+        print("[S3] Пропуск: нет S3_BUCKET")
 
     # PRAGMA для SQLite
     db_url_str = str(db_url_obj)
