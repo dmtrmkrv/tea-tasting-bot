@@ -47,7 +47,7 @@ from sqlalchemy.orm import (
 )
 # fmt: on
 
-from db import build_db_url_from_env, create_sa_engine
+from db import build_db_url_from_env, create_sa_engine, mask_dsn
 from storage.s3_client import create_s3_client, is_s3_enabled, missing_s3_env_vars
 
 # ---------------- ОКРУЖЕНИЕ И ЛОГИ ----------------
@@ -436,13 +436,6 @@ def setup_db(db_url: str):
             cfg.db_path = None
     engine = create_sa_engine(db_url_obj)
 
-    # безопасный лог без пароля
-    safe_db_url = str(db_url_obj)
-    pwd = os.getenv("POSTGRESQL_PASSWORD", "")
-    if pwd:
-        safe_db_url = safe_db_url.replace(pwd, "***")
-    print(f"[DB] Using: {safe_db_url}")
-
     try:
         with engine.connect() as conn:
             conn.execute(text("select 1"))
@@ -451,6 +444,9 @@ def setup_db(db_url: str):
     except Exception as e:
         print(f"[DB] FAIL: {e}")
         db_health_status = f"FAIL ({type(e).__name__})"
+    finally:
+        safe_db_url = mask_dsn(str(db_url_obj), os.getenv("POSTGRESQL_PASSWORD"))
+        print(f"[DB] Using: {safe_db_url}")
 
     s3_health()
 
