@@ -21,8 +21,6 @@ RUN python -m pip install --upgrade pip && pip install --no-cache-dir -r require
 
 COPY . .
 
-# дать права на запуск
-RUN chmod +x /app/start.sh
+RUN chmod +x /app/scripts/migrate.sh
 
-# запуск: ждем БД -> миграции -> бот
-CMD ["/app/start.sh"]
+CMD ["bash", "-lc", "python -m alembic -c alembic.ini upgrade head && python -m app.main"]
