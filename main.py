@@ -30,7 +30,6 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
-    create_engine,
     func,
     inspect,
     select,
@@ -45,6 +44,8 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 # fmt: on
+
+from db import build_db_url_from_env, create_sa_engine
 
 # ---------------- ОКРУЖЕНИЕ И ЛОГИ ----------------
 
@@ -299,15 +300,37 @@ def setup_db(db_url: str):
     """
     global SessionLocal, engine
     old_engine = engine
-    engine = create_engine(
-        db_url,
-        echo=False,
-        future=True,
-        connect_args={"check_same_thread": False}  # безопасно и уменьшает «залипания»
-    )
+    env_db_url = build_db_url_from_env(os)
+    if db_url and db_url != DATABASE_URL:
+        db_url_obj = db_url
+    else:
+        db_url_obj = env_db_url
+    if cfg is not None:
+        cfg.db_url = str(db_url_obj)
+        try:
+            url_obj = make_url(cfg.db_url)
+            if (
+                url_obj.drivername.startswith("sqlite")
+                and url_obj.database
+                and url_obj.database != ":memory:"
+            ):
+                cfg.db_path = os.path.abspath(url_obj.database)
+            else:
+                cfg.db_path = None
+        except Exception:
+            cfg.db_path = None
+    engine = create_sa_engine(db_url_obj)
+
+    # безопасный лог без пароля
+    safe_db_url = str(db_url_obj)
+    pwd = os.getenv("POSTGRESQL_PASSWORD", "")
+    if pwd:
+        safe_db_url = safe_db_url.replace(pwd, "***")
+    print(f"[DB] Using: {safe_db_url}")
 
     # PRAGMA для SQLite
-    if db_url.startswith("sqlite"):
+    db_url_str = str(db_url_obj)
+    if db_url_str.startswith("sqlite"):
         with engine.connect() as conn:
             conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
             conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
